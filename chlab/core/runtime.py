@@ -129,8 +129,14 @@ class Runtime:
         self._compose(self.registry.load(name), "stop")
 
     def start(self, name: str) -> InstanceStatus:
+        """Start an instance, recreating any containers that no longer exist.
+
+        Uses ``up -d`` rather than ``start`` so an instance that has been through ``down`` —
+        or whose containers were removed outside chlab — comes back on its existing data
+        volumes instead of being stranded with no way forward but ``rm``.
+        """
         spec = self.registry.load(name)
-        self._compose(spec, "start")
+        self._compose(spec, "up", "-d", "--remove-orphans")
         self._wait_healthy(build_topology(spec))
         return self.status(name)
 

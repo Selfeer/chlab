@@ -87,6 +87,36 @@ def test_server_errors_keep_the_server_message(server):
     assert failure.value.node == "clickhouse2"
 
 
+def test_json_formatted_errors_are_unwrapped(server):
+    """ClickHouse serialises errors in the requested format; the message must not stay buried."""
+    handler, url = server
+    handler.response = (
+        500,
+        json.dumps({"meta": [], "data": [], "rows": 0, "exception": "Code: 497. ACCESS_DENIED"}),
+    )
+    with pytest.raises(QueryError) as failure:
+        execute(url, "CREATE DATABASE nope")
+    assert str(failure.value) == "Code: 497. ACCESS_DENIED"
+
+
+def test_exception_in_a_200_response_is_still_an_error(server):
+    """A query failing mid-stream returns HTTP 200 with partial rows plus an exception."""
+    handler, url = server
+    handler.response = (
+        200,
+        json.dumps(
+            {
+                "meta": [{"name": "n", "type": "UInt64"}],
+                "data": [[1]],
+                "rows": 1,
+                "exception": "Code: 241. MEMORY_LIMIT_EXCEEDED",
+            }
+        ),
+    )
+    with pytest.raises(QueryError, match="MEMORY_LIMIT_EXCEEDED"):
+        execute(url, "SELECT huge()")
+
+
 def test_unreachable_node_is_a_query_error():
     with pytest.raises(QueryError, match="could not reach"):
         execute("http://127.0.0.1:1", "SELECT 1")

@@ -72,7 +72,7 @@ def execute(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode(errors="replace")
     except urllib.error.HTTPError as error:
-        detail = error.read().decode(errors="replace").strip()
+        detail = _error_message(error.read().decode(errors="replace"))
         raise QueryError(detail or f"HTTP {error.code} {error.reason}", node=node) from error
     except urllib.error.URLError as error:
         raise QueryError(f"could not reach {url}: {error.reason}", node=node) from error
@@ -80,6 +80,23 @@ def execute(
         raise QueryError(f"{url} timed out after {timeout}s", node=node) from error
 
     return _parse(body, node=node)
+
+
+def _error_message(body: str) -> str:
+    """Pull the exception out of an error body.
+
+    ClickHouse serialises errors in whatever format was requested, so with JSONCompact a
+    failed query returns a JSON document whose ``exception`` field holds the actual message.
+    Showing the raw document instead would bury it.
+    """
+    text = body.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(payload, dict) and payload.get("exception"):
+        return str(payload["exception"]).strip()
+    return text
 
 
 def _parse(body: str, *, node: str | None) -> QueryResult:
@@ -93,6 +110,12 @@ def _parse(body: str, *, node: str | None) -> QueryResult:
     except json.JSONDecodeError:
         # A non-JSON body means the query carried its own FORMAT clause; surface it as one cell.
         return QueryResult(columns=["result"], rows=[[body.rstrip("\n")]], node=node)
+
+    if isinstance(payload, dict) and payload.get("exception"):
+        # A query that fails after the response has started streaming comes back as HTTP 200
+        # with whatever rows were produced plus an exception field. Without this it would look
+        # like a successful partial result.
+        raise QueryError(payload["exception"], node=node)
 
     meta = payload.get("meta", [])
     statistics = payload.get("statistics", {})
