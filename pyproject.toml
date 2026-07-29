@@ -1,0 +1,33 @@
+[project]
+name = "chlab"
+version = "0.1.0"
+description = "Run any ClickHouse build, immediately."
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+chlab = "chlab.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["chlab*"]
+
+[tool.setuptools.package-data]
+chlab = ["web/templates/*.html", "web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

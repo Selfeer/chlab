@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}new cluster — chlab{% endblock %}
+{% block content %}
+
+<h1>New cluster</h1>
+
+<form id="create" class="form">
+  <section>
+    <h2>ClickHouse</h2>
+    <label>
+      Source
+      <input name="source" required spellcheck="false"
+             placeholder="docker://altinityinfra/clickhouse-server:… | https://…deb | /path/to/clickhouse">
+      <small>A Docker image, a build-artifact URL, a <code>.deb</code>/<code>.tgz</code>, or a local binary.</small>
+    </label>
+    <div class="row">
+      <label>
+        Instance name
+        <input name="name" placeholder="derived from the version" pattern="[a-z0-9][a-z0-9_-]*">
+      </label>
+      <label>
+        Version override
+        <input name="version" placeholder="detected automatically">
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Topology</h2>
+    {% if profiles %}
+      <label>
+        Start from a profile
+        <select name="profile">
+          <option value="">none</option>
+          {% for profile_name, profile in profiles.items() %}
+            <option value="{{ profile_name }}" data-profile='{{ profile|tojson }}'>{{ profile_name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    {% endif %}
+    <div class="row">
+      <label>Shards <input type="number" name="shards" value="1" min="1" max="10"></label>
+      <label>Replicas per shard <input type="number" name="replicas" value="1" min="1" max="10"></label>
+      <label>
+        Keeper nodes
+        <select name="keeper_nodes">
+          <option value="">automatic</option>
+          <option value="0">none</option>
+          <option value="1">1</option>
+          <option value="3">3 (quorum)</option>
+        </select>
+      </label>
+    </div>
+    <label>
+      Cluster name
+      <input name="cluster_name" value="default_cluster">
+    </label>
+    <p class="hint" id="topology-hint"></p>
+  </section>
+
+  <section>
+    <h2>Users</h2>
+    <div class="repeatable" id="users"></div>
+    <button type="button" class="button" data-add="user">add user</button>
+    <small>
+      Created as SQL users after start, so grants work normally.
+      <code>readwrite</code> can query and create; <code>admin</code> can also manage users.
+    </small>
+  </section>
+
+  <section>
+    <h2>Databases</h2>
+    <div class="repeatable" id="databases"></div>
+    <button type="button" class="button" data-add="database">add database</button>
+  </section>
+
+  <section>
+    <h2>Data</h2>
+    <label class="checkbox">
+      <input type="checkbox" name="seed">
+      Create the <code>demo</code> database with generated rows
+      <small>A MergeTree (or ReplicatedMergeTree) table plus a Distributed table over the cluster.</small>
+    </label>
+  </section>
+
+  <section>
+    <h2>Extras</h2>
+    <label>
+      Server settings
+      <textarea name="settings" rows="3" spellcheck="false"
+                placeholder="one per line, key=value"></textarea>
+    </label>
+    <label>
+      Save this topology as a profile
+      <input name="save_as_profile" placeholder="leave blank to skip">
+    </label>
+  </section>
+
+  <footer class="form-actions">
+    <button class="button primary" type="submit">launch</button>
+    <a class="button" href="/">cancel</a>
+  </footer>
+</form>
+
+<section id="progress" class="progress" hidden>
+  <h2>Launching <span id="progress-name"></span></h2>
+  <ol id="progress-events"></ol>
+  <pre id="progress-error" hidden></pre>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script>chlab.wireCreateForm();</script>
+{% endblock %}

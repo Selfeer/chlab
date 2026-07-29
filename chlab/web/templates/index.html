@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+
+{% if not instances %}
+  <section class="empty">
+    <h1>No clusters yet</h1>
+    <p>Point chlab at a Docker image, a build artifact URL, a <code>.deb</code>, or a local binary.</p>
+    <a class="button primary" href="/new">Create one</a>
+  </section>
+{% else %}
+  <h1>Instances</h1>
+  <div class="cards">
+    {% for instance in instances %}
+      <article class="card" data-name="{{ instance.name }}">
+        <header>
+          <h2><a href="/instance/{{ instance.name }}">{{ instance.name }}</a></h2>
+          <span class="state state-{{ instance.state }}">{{ instance.state }}</span>
+        </header>
+        <dl>
+          <dt>version</dt><dd>{{ instance.version or "unknown" }}</dd>
+          <dt>topology</dt>
+          <dd>
+            {{ instance.shards }} shard{{ "s" if instance.shards != 1 }}
+            &times; {{ instance.replicas }} replica{{ "s" if instance.replicas != 1 }}
+            {%- if instance.keepers %} + {{ instance.keepers|length }} keeper{% endif %}
+          </dd>
+          <dt>source</dt><dd class="mono truncate" title="{{ instance.source }}">{{ instance.source }}</dd>
+        </dl>
+        <footer>
+          <a class="button" href="/instance/{{ instance.name }}">open</a>
+          <a class="button" href="{{ instance.nodes[0].play }}" target="_blank" rel="noreferrer">play</a>
+          {% if instance.state == "running" %}
+            <button class="button" data-action="stop" data-target="{{ instance.name }}">stop</button>
+          {% else %}
+            <button class="button" data-action="start" data-target="{{ instance.name }}">start</button>
+          {% endif %}
+          <button class="button danger" data-action="destroy" data-target="{{ instance.name }}">delete</button>
+        </footer>
+      </article>
+    {% endfor %}
+  </div>
+{% endif %}
+
+{% endblock %}
+{% block scripts %}
+<script>chlab.wireInstanceActions();</script>
+{% endblock %}

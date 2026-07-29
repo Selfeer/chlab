@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}{{ instance.name }} — chlab{% endblock %}
+{% block content %}
+
+<header class="instance-header">
+  <div>
+    <h1>{{ instance.name }} <span class="state state-{{ instance.state }}">{{ instance.state }}</span></h1>
+    <p class="mono">{{ instance.version or "unknown version" }} · {{ instance.cluster_name }}</p>
+  </div>
+  <div class="actions">
+    {% if instance.state == "running" %}
+      <button class="button" data-action="stop" data-target="{{ instance.name }}">stop</button>
+    {% else %}
+      <button class="button" data-action="start" data-target="{{ instance.name }}">start</button>
+    {% endif %}
+    <button class="button danger" data-action="destroy" data-target="{{ instance.name }}">delete</button>
+  </div>
+</header>
+
+<table class="nodes">
+  <thead>
+    <tr><th>node</th><th>shard</th><th>replica</th><th>http</th><th>native</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for node in instance.nodes %}
+      <tr>
+        <td class="mono">{{ node.name }}</td>
+        <td>{{ node.shard }}</td>
+        <td>{{ node.replica }}</td>
+        <td class="mono">{{ node.http }}</td>
+        <td class="mono">127.0.0.1:{{ node.native }}</td>
+        <td><a class="button small" href="{{ node.play }}" target="_blank" rel="noreferrer">play</a></td>
+      </tr>
+    {% endfor %}
+    {% for keeper in instance.keepers %}
+      <tr class="keeper">
+        <td class="mono">{{ keeper.name }}</td>
+        <td colspan="3">keeper</td>
+        <td class="mono">127.0.0.1:{{ keeper.port }}</td>
+        <td></td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<section class="editor" data-instance="{{ instance.name }}">
+  <div class="editor-toolbar">
+    <select id="target">
+      <option value="">{{ instance.nodes[0].name }} (first node)</option>
+      {% for node in instance.nodes %}
+        <option value="{{ node.name }}">{{ node.name }}</option>
+      {% endfor %}
+      <option value="__all__">all nodes (compare)</option>
+    </select>
+    <input id="database" placeholder="database" value="">
+    <input id="user" placeholder="user" value="default">
+    <input id="password" type="password" placeholder="password">
+    <button class="button primary" id="run">run <kbd>⌘⏎</kbd></button>
+  </div>
+
+  <div id="editor-host">
+    <textarea id="sql" spellcheck="false" rows="8">SELECT hostName(), version()</textarea>
+  </div>
+
+  <div class="results-header">
+    <div id="agreement"></div>
+    <details id="history-panel">
+      <summary>history</summary>
+      <ul id="history"></ul>
+    </details>
+  </div>
+  <div id="results"></div>
+</section>
+
+{% endblock %}
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/ace.min.js"
+        onload="chlab.upgradeEditor()"
+        onerror="console.warn('chlab: ace unavailable, using a plain textarea')"></script>
+<script>chlab.wireEditor(); chlab.wireInstanceActions();</script>
+{% endblock %}
