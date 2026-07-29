@@ -74,8 +74,9 @@
 
 {% endblock %}
 {% block scripts %}
-<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/ace.min.js"
-        onload="chlab.upgradeEditor()"
-        onerror="console.warn('chlab: ace unavailable, using a plain textarea')"></script>
+<!-- Ace is vendored, not loaded from a CDN: this page runs arbitrary SQL and deletes
+     clusters, so it does not import a script from a third party. It also has to work on an
+     air-gapped machine. -->
+<script src="/static/vendor/ace/ace.min.js" onload="chlab.upgradeEditor()"></script>
 <script>chlab.wireEditor(); chlab.wireInstanceActions();</script>
 {% endblock %}

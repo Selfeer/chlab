@@ -15,7 +15,9 @@ def registry(tmp_path: Path) -> Registry:
 
 
 def spec(name="lab", **overrides) -> ClusterSpec:
-    return ClusterSpec(**{"name": name, "source": "/bin/clickhouse", "port_base": 21000, **overrides})
+    return ClusterSpec(
+        **{"name": name, "source": "/bin/clickhouse", "port_base": 21000, **overrides}
+    )
 
 
 def test_saved_specs_round_trip(registry: Registry):

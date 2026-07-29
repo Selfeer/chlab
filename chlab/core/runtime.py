@@ -5,18 +5,20 @@ from __future__ import annotations
 import json
 import subprocess
 import time
+from collections import defaultdict
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-from typing import Callable, Iterable
 
 from . import compose, configgen, seed
 from .cache import Cache
+from .errors import ChlabError
 from .image import ensure_base_image
 from .ports import allocate_block
 from .query import QueryError, execute, keeper_ok, ping
 from .registry import InstanceExists, Registry
-from .resolve import Resolved, resolve
+from .resolve import resolve
 from .spec import ClusterSpec
 from .topology import Node, Topology, build_topology, port_span
 
@@ -28,11 +30,15 @@ LOG_TAIL_ON_FAILURE = 40
 COMPOSE_TIMEOUT = 900
 
 
-class RuntimeError_(RuntimeError):
+#: Fan-out and readiness polling are IO-bound waits on independent nodes.
+MAX_PARALLEL_NODES = 16
+
+
+class ClusterError(ChlabError):
     """A failure bringing a cluster up or down."""
 
 
-class InitError(RuntimeError):
+class InitError(ChlabError):
     """The cluster started but the post-start DDL failed."""
 
 
@@ -47,7 +53,8 @@ class ServiceStatus:
 class InstanceStatus:
     spec: ClusterSpec
     topology: Topology
-    services: tuple[ServiceStatus, ...]
+    #: None when Docker could not be reached, as opposed to () for "no containers exist".
+    services: tuple[ServiceStatus, ...] | None
 
     @property
     def running(self) -> bool:
@@ -55,10 +62,14 @@ class InstanceStatus:
 
     @property
     def any_running(self) -> bool:
-        return any(service.running for service in self.services)
+        return any(service.running for service in self.services or ())
 
     @property
     def state(self) -> str:
+        if self.services is None:
+            # Reporting "created" here would claim the containers are gone when in fact we
+            # simply could not ask.
+            return "unknown"
         if not self.services:
             return "created"
         if self.running:
@@ -79,21 +90,26 @@ class Runtime:
         *,
         force_resolve: bool = False,
         recreate: bool = False,
+        sha256: str | None = None,
         on_event: EventCallback | None = None,
     ) -> InstanceStatus:
         """Resolve, generate, launch, wait, and initialise."""
         notify = on_event or (lambda _message: None)
 
-        if self.registry.exists(spec.name) and not recreate:
-            raise InstanceExists(
-                f"instance {spec.name!r} already exists; "
-                "use `chlab rm` to remove it or pick another --name"
-            )
+        if self.registry.exists(spec.name):
+            if not recreate:
+                raise InstanceExists(
+                    f"instance {spec.name!r} already exists. Pass --recreate to relaunch it in "
+                    f"place (keeping its ports and data), `chlab rm {spec.name}` to delete it, "
+                    "or --name to launch a second one alongside."
+                )
+            spec = self._inherit_ports(spec, notify)
 
         resolved = resolve(
             spec.source,
             version=spec.version,
             force=force_resolve,
+            sha256=sha256,
             cache=self.cache,
             on_event=notify,
         )
@@ -125,19 +141,39 @@ class Runtime:
 
         return self.status(spec.name)
 
+    def _inherit_ports(self, spec: ClusterSpec, notify: EventCallback) -> ClusterSpec:
+        """Keep a recreated instance on the ports it already had.
+
+        Without this, `--recreate` would allocate a fresh block, so every bookmarked `/play`
+        URL and every open client would silently point at nothing — while the data volumes,
+        which are keyed by project name rather than port, carried on being reused.
+        """
+        if spec.port_base is not None:
+            return spec
+        try:
+            existing = self.registry.load(spec.name)
+        except ChlabError:
+            return spec  # unreadable spec: fall through to a fresh allocation
+        if existing.port_base is None:
+            return spec
+        notify(f"reusing ports {existing.port_base}-{existing.port_base + port_span(spec) - 1}")
+        return spec.with_ports(existing.port_base)
+
     def stop(self, name: str) -> None:
         self._compose(self.registry.load(name), "stop")
 
-    def start(self, name: str) -> InstanceStatus:
+    def start(self, name: str, *, on_event: EventCallback | None = None) -> InstanceStatus:
         """Start an instance, recreating any containers that no longer exist.
 
         Uses ``up -d`` rather than ``start`` so an instance that has been through ``down`` —
         or whose containers were removed outside chlab — comes back on its existing data
         volumes instead of being stranded with no way forward but ``rm``.
         """
+        notify = on_event or (lambda _message: None)
         spec = self.registry.load(name)
+        notify("starting containers")
         self._compose(spec, "up", "-d", "--remove-orphans")
-        self._wait_healthy(build_topology(spec))
+        self._wait_healthy(build_topology(spec), notify=notify)
         return self.status(name)
 
     def down(self, name: str) -> None:
@@ -154,14 +190,18 @@ class Runtime:
 
     def status(self, name: str) -> InstanceStatus:
         spec = self.registry.load(name)
-        return InstanceStatus(
-            spec=spec,
-            topology=build_topology(spec),
-            services=tuple(self._services(spec)),
-        )
+        return self._status(spec, _compose_containers())
 
     def list(self) -> list[InstanceStatus]:
-        return [self.status(spec.name) for spec in self.registry.list()]
+        """Every instance, using a single `docker ps` rather than one per instance."""
+        containers = _compose_containers()
+        return [self._status(spec, containers) for spec in self.registry.list()]
+
+    def _status(
+        self, spec: ClusterSpec, containers: dict[str, list[ServiceStatus]] | None
+    ) -> InstanceStatus:
+        services = None if containers is None else tuple(containers.get(spec.project_name, ()))
+        return InstanceStatus(spec=spec, topology=build_topology(spec), services=services)
 
     def logs(
         self, name: str, service: str | None = None, *, follow: bool = False, tail: int = 200
@@ -191,12 +231,19 @@ class Runtime:
         user: str = "default",
         password: str = "",
         database: str | None = None,
+        settings: dict[str, str] | None = None,
     ):
-        """Run a query against one node, or every node when ``node`` is None and fan-out is asked."""
+        """Run a query against a single node, defaulting to the first. See query_all for fan-out."""
         status = self.status(name)
         target = status.topology.node(node) if node else status.topology.nodes[0]
         return execute(
-            target.http_url, sql, user=user, password=password, database=database, node=target.name
+            target.http_url,
+            sql,
+            user=user,
+            password=password,
+            database=database,
+            settings=settings,
+            node=target.name,
         )
 
     def query_all(
@@ -207,25 +254,31 @@ class Runtime:
         user: str = "default",
         password: str = "",
         database: str | None = None,
+        settings: dict[str, str] | None = None,
     ) -> list:
-        """Run the same query on every node; failures come back as QueryError values."""
+        """Run the same query on every node; failures come back as QueryError values.
+
+        Nodes are queried concurrently. Serially, a query that times out everywhere would take
+        the timeout multiplied by the node count — half an hour at the 30-node maximum — which
+        defeats the point of a fan-out.
+        """
         status = self.status(name)
-        results = []
-        for node in status.topology.nodes:
+
+        def run(node: Node):
             try:
-                results.append(
-                    execute(
-                        node.http_url,
-                        sql,
-                        user=user,
-                        password=password,
-                        database=database,
-                        node=node.name,
-                    )
+                return execute(
+                    node.http_url,
+                    sql,
+                    user=user,
+                    password=password,
+                    database=database,
+                    settings=settings,
+                    node=node.name,
                 )
             except QueryError as failure:
-                results.append(failure)
-        return results
+                return failure
+
+        return _in_parallel(run, status.topology.nodes)
 
     # --- internals -----------------------------------------------------------------------
 
@@ -244,13 +297,14 @@ class Runtime:
         deadline = time.monotonic() + HEALTH_TIMEOUT
         pending = list(topology.keepers)
         while pending and time.monotonic() < deadline:
-            pending = [keeper for keeper in pending if not keeper_ok(keeper.client_port)]
+            ready = _in_parallel(lambda k: keeper_ok(k.client_port), pending)
+            pending = [keeper for keeper, ok in zip(pending, ready, strict=True) if not ok]
             if pending:
                 time.sleep(HEALTH_INTERVAL)
 
         if pending:
             names = ", ".join(keeper.name for keeper in pending)
-            raise RuntimeError_(f"{names} did not become ready within {HEALTH_TIMEOUT}s")
+            raise ClusterError(f"{names} did not become ready within {HEALTH_TIMEOUT}s")
 
     def _wait_zookeeper_sessions(self, topology: Topology, *, notify: EventCallback) -> None:
         """A healthy server is not necessarily connected to Keeper yet.
@@ -265,20 +319,23 @@ class Runtime:
         deadline = time.monotonic() + HEALTH_TIMEOUT
         pending = list(topology.nodes)
         while pending and time.monotonic() < deadline:
-            pending = [node for node in pending if not self._zookeeper_connected(node)]
+            connected = _in_parallel(self._zookeeper_connected, pending)
+            pending = [node for node, ok in zip(pending, connected, strict=True) if not ok]
             if pending:
                 time.sleep(HEALTH_INTERVAL)
 
         if pending:
             names = ", ".join(node.name for node in pending)
-            raise RuntimeError_(
+            raise ClusterError(
                 f"{names} did not connect to keeper within {HEALTH_TIMEOUT}s\n\n"
                 + self._tail_logs(topology.spec, pending)
             )
 
     def _zookeeper_connected(self, node: Node) -> bool:
         try:
-            execute(node.http_url, "SELECT name FROM system.zookeeper WHERE path = '/'", node=node.name)
+            execute(
+                node.http_url, "SELECT name FROM system.zookeeper WHERE path = '/'", node=node.name
+            )
         except QueryError:
             return False
         return True
@@ -288,7 +345,8 @@ class Runtime:
         pending = list(topology.nodes)
 
         while pending and time.monotonic() < deadline:
-            still_pending = [node for node in pending if not ping(node.http_url)]
+            reachable = _in_parallel(lambda node: ping(node.http_url), pending)
+            still_pending = [node for node, ok in zip(pending, reachable, strict=True) if not ok]
             if len(still_pending) != len(pending):
                 ready = len(topology.nodes) - len(still_pending)
                 notify(f"waiting for nodes ({ready}/{len(topology.nodes)} ready)")
@@ -298,7 +356,7 @@ class Runtime:
 
         if pending:
             names = ", ".join(node.name for node in pending)
-            raise RuntimeError_(
+            raise ClusterError(
                 f"{names} did not become healthy within {HEALTH_TIMEOUT}s\n\n"
                 + self._tail_logs(topology.spec, pending)
             )
@@ -346,26 +404,6 @@ class Runtime:
             return True
         return not result.rows or int(result.rows[0][0]) == 0
 
-    def _services(self, spec: ClusterSpec) -> list[ServiceStatus]:
-        compose_file = self.registry.instance_dir(spec.name) / "docker-compose.yml"
-        if not compose_file.is_file():
-            return []
-        result = subprocess.run(
-            self._compose_command(spec, "ps", "--all", "--format", "json"),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return []
-        return [
-            ServiceStatus(
-                name=entry.get("Service", entry.get("Name", "?")),
-                state=entry.get("State", "unknown"),
-                running=entry.get("State") == "running",
-            )
-            for entry in _parse_compose_ps(result.stdout)
-        ]
-
     def _tail_logs(self, spec: ClusterSpec, nodes: Iterable[Node]) -> str:
         chunks = []
         for node in nodes:
@@ -381,8 +419,10 @@ class Runtime:
         compose_file = self.registry.instance_dir(spec.name) / "docker-compose.yml"
         return [
             *compose_executable(),
-            "--project-name", spec.project_name,
-            "--file", str(compose_file),
+            "--project-name",
+            spec.project_name,
+            "--file",
+            str(compose_file),
             *args,
         ]
 
@@ -394,7 +434,7 @@ class Runtime:
             timeout=COMPOSE_TIMEOUT,
         )
         if check and result.returncode != 0:
-            raise RuntimeError_(
+            raise ClusterError(
                 "docker compose failed:\n" + (result.stderr.strip() or result.stdout.strip())
             )
         return result.stdout
@@ -412,7 +452,55 @@ def compose_executable() -> tuple[str, ...]:
             continue
         if result.returncode == 0:
             return candidate
-    raise RuntimeError_("docker compose was not found; install Docker Compose v2")
+    raise ClusterError("docker compose was not found; install Docker Compose v2")
+
+
+def _in_parallel(work, items: list):
+    """Map ``work`` over ``items`` concurrently, preserving order."""
+    items = list(items)
+    if len(items) < 2:
+        return [work(item) for item in items]
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_NODES, len(items))) as pool:
+        return list(pool.map(work, items))
+
+
+def _compose_containers() -> dict[str, list[ServiceStatus]] | None:
+    """Every compose-managed container on the host, bucketed by project.
+
+    One `docker ps` for all instances rather than one `compose ps` each: process spawns cost
+    a few hundred milliseconds apiece, and `chlab ls` and the web dashboard both iterate every
+    instance. Returns None when Docker cannot be reached, which the caller reports as
+    "unknown" rather than pretending the containers are gone.
+    """
+    result = subprocess.run(
+        ["docker", "ps", "--all", "--no-trunc", "--format", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    buckets: dict[str, list[ServiceStatus]] = defaultdict(list)
+    for entry in _parse_compose_ps(result.stdout):
+        labels = _parse_labels(entry.get("Labels", ""))
+        project = labels.get("com.docker.compose.project")
+        service = labels.get("com.docker.compose.service")
+        if not project or not service:
+            continue
+        state = entry.get("State", "unknown")
+        buckets[project].append(
+            ServiceStatus(name=service, state=state, running=state == "running")
+        )
+    return dict(buckets)
+
+
+def _parse_labels(raw: str) -> dict[str, str]:
+    labels = {}
+    for item in raw.split(","):
+        key, separator, value = item.partition("=")
+        if separator:
+            labels[key.strip()] = value.strip()
+    return labels
 
 
 def _parse_compose_ps(output: str) -> list[dict]:

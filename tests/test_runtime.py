@@ -20,7 +20,7 @@ def runtime(tmp_path: Path, monkeypatch):
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(Runtime, "_compose", lambda self, spec, *args, **kw: calls.append(args))
     monkeypatch.setattr(Runtime, "_wait_healthy", lambda self, topology, **kw: None)
-    monkeypatch.setattr(Runtime, "_services", lambda self, spec: [])
+    monkeypatch.setattr("chlab.core.runtime._compose_containers", lambda: {})
     return runtime, calls
 
 
@@ -81,3 +81,42 @@ def test_client_command_targets_the_named_container(tmp_path: Path):
 def test_compose_ps_accepts_both_output_shapes(output, expected):
     """Compose has emitted both newline-delimited objects and a JSON array."""
     assert len(_parse_compose_ps(output)) == expected
+
+
+def test_recreate_keeps_the_existing_ports(tmp_path: Path, monkeypatch):
+    """Otherwise every bookmarked /play URL silently points at nothing after a recreate."""
+    from chlab.core.resolve import Resolved
+    from chlab.core.sources import ArtifactType, Source, SourceKind
+
+    registry = Registry(tmp_path / "state")
+    registry.save(ClusterSpec(name="lab", source="/bin/clickhouse", port_base=21600))
+    instance = Runtime(registry=registry)
+
+    monkeypatch.setattr(Runtime, "_compose", lambda self, spec, *a, **k: None)
+    monkeypatch.setattr(Runtime, "_wait_healthy", lambda self, topology, **k: None)
+    monkeypatch.setattr(Runtime, "_initialise", lambda self, topology, **k: None)
+    monkeypatch.setattr("chlab.core.runtime._compose_containers", lambda: {})
+    monkeypatch.setattr("chlab.core.runtime.ensure_base_image", lambda: "chlab/base:test")
+    monkeypatch.setattr(
+        "chlab.core.runtime.resolve",
+        lambda *a, **k: Resolved(
+            source=Source("/x", SourceKind.PATH, "/x", ArtifactType.BINARY),
+            version="24.8.1.1",
+            binary_path=tmp_path / "clickhouse",
+        ),
+    )
+    (tmp_path / "clickhouse").write_bytes(b"")
+
+    status = instance.up(ClusterSpec(name="lab", source="/bin/clickhouse"), recreate=True)
+    assert status.spec.port_base == 21600
+
+
+def test_recreate_allocates_ports_when_the_old_spec_is_unreadable(tmp_path: Path, monkeypatch):
+    registry = Registry(tmp_path / "state")
+    directory = registry.instance_dir("lab")
+    directory.mkdir(parents=True)
+    (directory / "spec.json").write_text("{truncated")
+    instance = Runtime(registry=registry)
+
+    spec = instance._inherit_ports(ClusterSpec(name="lab", source="/x"), lambda _m: None)
+    assert spec.port_base is None  # falls through to a fresh allocation rather than raising

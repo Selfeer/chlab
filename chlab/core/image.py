@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import subprocess
 
+from .errors import ChlabError
+
 BASE_DOCKERFILE = """\
 FROM ubuntu:24.04
 
@@ -37,7 +39,7 @@ IMAGE_REPOSITORY = "chlab/base"
 BUILD_TIMEOUT = 900
 
 
-class ImageError(RuntimeError):
+class ImageError(ChlabError):
     pass
 
 
@@ -69,7 +71,5 @@ def ensure_base_image(*, force: bool = False) -> str:
 
 
 def _image_exists(tag: str) -> bool:
-    result = subprocess.run(
-        ["docker", "image", "inspect", tag], capture_output=True, text=True
-    )
+    result = subprocess.run(["docker", "image", "inspect", tag], capture_output=True, text=True)
     return result.returncode == 0

@@ -51,7 +51,11 @@ def render(tmp_path: Path, resolved: Resolved, **kwargs) -> dict:
 def test_every_node_and_keeper_becomes_a_service(tmp_path: Path):
     document = render(tmp_path, binary_resolved(tmp_path))
     assert set(document["services"]) == {
-        "clickhouse1", "clickhouse2", "clickhouse3", "clickhouse4", "keeper1",
+        "clickhouse1",
+        "clickhouse2",
+        "clickhouse3",
+        "clickhouse4",
+        "keeper1",
     }
 
 
@@ -113,7 +117,11 @@ def test_no_keeper_dependency_when_there_is_no_keeper(tmp_path: Path):
 def test_each_service_gets_its_own_data_volume(tmp_path: Path):
     document = render(tmp_path, binary_resolved(tmp_path))
     assert set(document["volumes"]) == {
-        "clickhouse1-data", "clickhouse2-data", "clickhouse3-data", "clickhouse4-data", "keeper1-data",
+        "clickhouse1-data",
+        "clickhouse2-data",
+        "clickhouse3-data",
+        "clickhouse4-data",
+        "keeper1-data",
     }
 
 

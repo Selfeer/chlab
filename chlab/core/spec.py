@@ -11,22 +11,31 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
+from .errors import ChlabError
+
 DEFAULT_CLUSTER_NAME = "default_cluster"
 DEFAULT_USER = "default"
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+#: Also the bound that keeps node ports clear of keeper ports; see topology.KEEPER_PORT_OFFSET.
+MAX_NODES = 30
+#: A ClickHouse config element name. Keys become XML tags, which ElementTree will not validate.
+SETTING_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
-class SpecError(ValueError):
+class SpecError(ChlabError):
     pass
 
 
-class UserRole(str, enum.Enum):
+class UserRole(enum.StrEnum):
     """Privilege preset applied to a user when the cluster starts."""
 
     NONE = "none"
     READONLY = "readonly"
     READWRITE = "readwrite"
     ADMIN = "admin"
+
+
+ROLE_NAMES = frozenset(member.value for member in UserRole)
 
 
 @dataclass(frozen=True)
@@ -41,10 +50,10 @@ class UserSpec:
     def __post_init__(self) -> None:
         # JSON has no tuples, so a spec read back from disk arrives with lists.
         object.__setattr__(self, "grants", tuple(self.grants))
-        if self.role not in {member.value for member in UserRole}:
+        if self.role not in ROLE_NAMES:
             raise SpecError(
                 f"unknown role {self.role!r} for user {self.name!r}; "
-                f"expected one of {', '.join(member.value for member in UserRole)}"
+                f"expected one of {', '.join(sorted(ROLE_NAMES))}"
             )
 
     @property
@@ -83,6 +92,10 @@ class ClusterSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "users", tuple(self.users))
         object.__setattr__(self, "databases", tuple(self.databases))
+        # Copied so a caller mutating the dict it passed in cannot change this spec. The
+        # dataclass is frozen but that only guards rebinding, not the dict's contents.
+        object.__setattr__(self, "settings", dict(self.settings))
+
         if not NAME_PATTERN.match(self.name):
             raise SpecError(
                 f"instance name {self.name!r} must be lowercase letters, digits, '-' or '_', "
@@ -90,10 +103,15 @@ class ClusterSpec:
             )
         if self.shards < 1 or self.replicas < 1:
             raise SpecError("shards and replicas must both be at least 1")
-        if self.node_count > 30:
-            raise SpecError(f"{self.node_count} nodes is more than chlab will launch at once")
+        if self.node_count > MAX_NODES:
+            raise SpecError(
+                f"{self.node_count} nodes exceeds the {MAX_NODES}-node limit chlab launches "
+                "at once (also the bound that keeps node ports clear of keeper ports)"
+            )
         if self.keeper_nodes is not None and self.keeper_nodes < 0:
             raise SpecError("keeper_nodes cannot be negative")
+        for key in self.settings:
+            validate_setting_key(key)
         for database in self.databases:
             if database.engine == "Replicated" and self.effective_keeper_nodes == 0:
                 raise SpecError(
@@ -121,10 +139,10 @@ class ClusterSpec:
         """Docker Compose project name; namespaces every container and volume."""
         return f"chlab-{self.name}"
 
-    def with_ports(self, port_base: int) -> "ClusterSpec":
+    def with_ports(self, port_base: int) -> ClusterSpec:
         return replace(self, port_base=port_base)
 
-    def with_version(self, version: str) -> "ClusterSpec":
+    def with_version(self, version: str) -> ClusterSpec:
         return replace(self, version=version)
 
     # --- serialization -------------------------------------------------------------------
@@ -133,24 +151,43 @@ class ClusterSpec:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ClusterSpec":
+    def from_dict(cls, data: dict[str, Any]) -> ClusterSpec:
         """Rebuild a spec, ignoring fields this version does not know about.
 
         Specs outlive the code that wrote them — an instance created by a different chlab
         must still be listable and removable rather than crashing the command.
         """
         payload = dict(data)
-        payload["users"] = tuple(_construct(UserSpec, user) for user in payload.get("users") or ())
+        payload["users"] = tuple(construct(UserSpec, user) for user in payload.get("users") or ())
         payload["databases"] = tuple(
-            _construct(DatabaseSpec, database) for database in payload.get("databases") or ()
+            construct(DatabaseSpec, database) for database in payload.get("databases") or ()
         )
-        return _construct(cls, payload)
+        return construct(cls, payload)
 
 
-def _construct(cls, data: dict[str, Any]):
-    """Build a dataclass from a dict, dropping keys it does not declare."""
+def construct(cls, data: dict[str, Any]):
+    """Build a dataclass from a dict, dropping keys it does not declare.
+
+    Used everywhere untrusted or older/newer persisted state is turned back into objects, so
+    an unrecognised field is ignored rather than raising ``TypeError`` at the constructor.
+    """
     known = set(cls.__dataclass_fields__)
     return cls(**{key: value for key, value in data.items() if key in known})
+
+
+def validate_setting_key(key: str) -> str:
+    """Reject setting names that would produce malformed XML.
+
+    Keys become element names in ``config.d``. ElementTree does not validate them, so an
+    invalid key yields a config the server rejects at startup — surfacing as a health-check
+    timeout minutes later, far from the actual mistake.
+    """
+    if not SETTING_KEY_PATTERN.match(key):
+        raise SpecError(
+            f"invalid setting name {key!r}; expected a ClickHouse config element name "
+            "(letters, digits, '_', '.' and '-', not starting with a digit)"
+        )
+    return key
 
 
 _VERSION_IN_TEXT = re.compile(r"\d+\.\d+\.\d+(?:\.\d+)?")
@@ -182,18 +219,24 @@ def suggest_name(source: str, *, taken: set[str] | None = None) -> str:
 
 
 def parse_user(text: str) -> UserSpec:
-    """Parse a ``--user name[:password][:role]`` argument."""
-    parts = text.split(":")
-    if len(parts) > 3:
-        raise SpecError(f"could not parse user {text!r}; expected name[:password][:role]")
+    """Parse a ``--user name[:password][:role]`` argument.
 
+    The role is recognised only as a trailing field holding a known role name, so passwords
+    containing colons still work: ``dev:p:ss`` is the password ``p:ss``, while ``dev:p:admin``
+    is the password ``p`` with the admin role.
+    """
+    parts = text.split(":")
     name = parts[0].strip()
     if not name:
         raise SpecError(f"user {text!r} has no name")
 
-    password = parts[1] if len(parts) > 1 else ""
-    role = (parts[2].strip().lower() or UserRole.READWRITE.value) if len(parts) > 2 else UserRole.READWRITE.value
-    return UserSpec(name=name, password=password, role=role)
+    rest = parts[1:]
+    role = UserRole.READWRITE.value
+    if len(rest) > 1 and rest[-1].strip().lower() in ROLE_NAMES:
+        role = rest[-1].strip().lower()
+        rest = rest[:-1]
+
+    return UserSpec(name=name, password=":".join(rest), role=role)
 
 
 def parse_grant(text: str) -> tuple[str, str]:
@@ -214,3 +257,11 @@ def parse_database(text: str) -> DatabaseSpec:
     if engine not in {"Atomic", "Replicated"}:
         raise SpecError(f"unsupported database engine {engine!r}; use Atomic or Replicated")
     return DatabaseSpec(name=name, engine=engine)
+
+
+def parse_setting(text: str) -> tuple[str, str]:
+    """Parse a ``--setting key=value`` argument."""
+    key, separator, value = text.partition("=")
+    if not separator:
+        raise SpecError(f"setting {text!r} must be written key=value")
+    return validate_setting_key(key.strip()), value.strip()

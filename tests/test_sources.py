@@ -19,7 +19,11 @@ DEB_URL = (
 @pytest.mark.parametrize(
     "raw, kind, artifact",
     [
-        ("docker://altinityinfra/clickhouse-server:1984-26.3.12", SourceKind.DOCKER, ArtifactType.IMAGE),
+        (
+            "docker://altinityinfra/clickhouse-server:1984-26.3.12",
+            SourceKind.DOCKER,
+            ArtifactType.IMAGE,
+        ),
         (DEB_URL, SourceKind.URL, ArtifactType.DEB),
         ("https://example.com/clickhouse.tgz", SourceKind.URL, ArtifactType.TGZ),
         ("https://example.com/clickhouse.tar.gz", SourceKind.URL, ArtifactType.TGZ),
@@ -72,7 +76,10 @@ def test_rejects_rpm_for_now(raw):
 @pytest.mark.parametrize(
     "image, expected",
     [
-        ("altinityinfra/clickhouse-server:1984-26.3.12.20001.altinityantalya", "26.3.12.20001.altinityantalya"),
+        (
+            "altinityinfra/clickhouse-server:1984-26.3.12.20001.altinityantalya",
+            "26.3.12.20001.altinityantalya",
+        ),
         ("clickhouse/clickhouse-server:24.8.14.10501", "24.8.14.10501"),
         ("clickhouse/clickhouse-server:latest", None),
         ("clickhouse/clickhouse-server", None),

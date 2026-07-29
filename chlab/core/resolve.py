@@ -6,16 +6,18 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from .cache import Cache, cache_key
-from .download import ProgressCallback, copy_local, download
+from .download import ProgressCallback, copy_local, download, verify_sha256
+from .errors import ChlabError
 from .sources import ArtifactType, Source, SourceKind, parse_source, version_from_image_tag
 from .unpack import extract_binary
 
-DEFAULT_PROGRAM = "clickhouse"
+#: chlab only ever extracts the ClickHouse binary; Keeper runs from the same one.
+PROGRAM = "clickhouse"
 #: Throwaway image used to run a static binary when the host cannot execute it directly.
 VERSION_PROBE_IMAGE = "ubuntu:24.04"
 VERSION_TIMEOUT = 120
@@ -26,7 +28,7 @@ EventCallback = Callable[[str], None]
 _VERSION = re.compile(r"version\s+([0-9][0-9A-Za-z.\-+_]*)", re.IGNORECASE)
 
 
-class ResolveError(RuntimeError):
+class ResolveError(ChlabError):
     pass
 
 
@@ -50,9 +52,9 @@ class Resolved:
 def resolve(
     raw: str,
     *,
-    program: str = DEFAULT_PROGRAM,
     version: str | None = None,
     force: bool = False,
+    sha256: str | None = None,
     cache: Cache | None = None,
     on_event: EventCallback | None = None,
     on_progress: ProgressCallback | None = None,
@@ -60,23 +62,29 @@ def resolve(
     """Resolve ``raw`` into a runnable image or binary.
 
     ``version`` overrides detection entirely, mirroring ``--clickhouse-version`` in Altinity's
-    regression suite. ``force`` re-downloads and re-detects, ignoring the cache.
+    regression suite. ``force`` re-downloads and re-detects, ignoring the cache. ``sha256``,
+    when given, must match the downloaded artifact.
     """
     source = parse_source(raw)
     cache = cache or Cache.default()
     key = cache_key(source)
     notify = on_event or (lambda _message: None)
 
+    if source.kind is SourceKind.URL and source.value.startswith("http://"):
+        notify(
+            "warning: this source is plain HTTP, so its contents can be replaced in transit; "
+            "prefer https:// or pass --sha256"
+        )
+
     if source.is_docker:
-        return _resolve_docker(source, key, cache, program, version, force, notify)
-    return _resolve_file(source, key, cache, program, version, force, notify, on_progress)
+        return _resolve_docker(source, key, cache, version, force, notify)
+    return _resolve_file(source, key, cache, version, force, sha256, notify, on_progress)
 
 
 def _resolve_docker(
     source: Source,
     key: str,
     cache: Cache,
-    program: str,
     version: str | None,
     force: bool,
     notify: EventCallback,
@@ -84,13 +92,19 @@ def _resolve_docker(
     image = source.value
     already_present = _image_present(image)
 
+    if already_present and not force and _is_floating_tag(image):
+        notify(
+            f"warning: {image} has a moving tag, so the local copy may be stale; "
+            "pass --force-resolve to re-pull"
+        )
+
     if force or not already_present:
         notify(f"pulling {image}")
         _pull_image(image)
 
-    detected = version or _cached_version(cache, key, program, force)
+    detected = version or _cached_version(cache, key, force)
     if detected is None:
-        detected = _version_from_image(image, program)
+        detected = _version_from_image(image)
         if detected is None:
             detected = version_from_image_tag(image)
             if detected is None:
@@ -99,11 +113,11 @@ def _resolve_docker(
                     "pass --clickhouse-version to set it explicitly"
                 )
             notify(
-                f"could not run {program} inside {image}; "
+                f"could not run {PROGRAM} inside {image}; "
                 f"falling back to the version in its tag ({detected})"
             )
 
-    _write_meta(cache, key, source, program, detected, docker_image=image)
+    _write_meta(cache, key, source, detected, docker_image=image)
     return Resolved(
         source=source,
         version=detected,
@@ -116,9 +130,9 @@ def _resolve_file(
     source: Source,
     key: str,
     cache: Cache,
-    program: str,
     version: str | None,
     force: bool,
+    sha256: str | None,
     notify: EventCallback,
     on_progress: ProgressCallback | None,
 ) -> Resolved:
@@ -128,26 +142,26 @@ def _resolve_file(
         binary_path = _local_binary(source)
         cached = cache.read_meta(key) is not None and not force
     else:
-        binary_path = cache.bin_dir(key) / program
+        binary_path = cache.bin_dir(key) / PROGRAM
         cached = binary_path.exists() and not force
         if not cached:
-            package = _fetch_artifact(source, key, cache, force, notify, on_progress)
+            package = _fetch_artifact(source, key, cache, force, sha256, notify, on_progress)
             if source.artifact is ArtifactType.BINARY:
                 binary_path = _install_binary(package, binary_path)
             else:
                 notify(f"unpacking {package.name}")
-                binary_path = extract_binary(package, program, binary_path)
+                binary_path = extract_binary(package, PROGRAM, binary_path)
 
-    detected = version or _cached_version(cache, key, program, force)
+    detected = version or _cached_version(cache, key, force)
     if detected is None:
-        detected = _version_from_binary(binary_path, program)
+        detected = _version_from_binary(binary_path, trusted=source.kind is SourceKind.PATH)
         if detected is None:
             raise ResolveError(
                 f"could not determine the ClickHouse version of {binary_path}; "
                 "pass --clickhouse-version to set it explicitly"
             )
 
-    _write_meta(cache, key, source, program, detected, binary_path=binary_path)
+    _write_meta(cache, key, source, detected, binary_path=binary_path)
     return Resolved(source=source, version=detected, binary_path=binary_path, cached=cached)
 
 
@@ -156,18 +170,22 @@ def _fetch_artifact(
     key: str,
     cache: Cache,
     force: bool,
+    sha256: str | None,
     notify: EventCallback,
     on_progress: ProgressCallback | None,
 ) -> Path:
     """Get the referenced file onto local disk and return its path."""
     if source.kind is SourceKind.URL:
-        filename = source.filename or DEFAULT_PROGRAM
+        filename = source.filename or PROGRAM
         dest = cache.artifact_dir(key) / filename
         if not dest.exists() or force:
             notify(f"downloading {filename}")
-        return download(source.value, dest, force=force, on_progress=on_progress)
+        return download(source.value, dest, force=force, sha256=sha256, on_progress=on_progress)
 
-    return _existing_file(Path(source.value))
+    path = _existing_file(Path(source.value))
+    if sha256:
+        verify_sha256(path, sha256)
+    return path
 
 
 def _local_binary(source: Source) -> Path:
@@ -204,32 +222,73 @@ def _make_executable(path: Path) -> None:
 # --- version detection -------------------------------------------------------------------
 
 
-def _version_from_binary(binary: Path, program: str) -> str | None:
-    """Ask the binary for its version, on the host if possible and in a container if not."""
-    on_host = _run([str(binary), "server", "--version"], timeout=VERSION_TIMEOUT)
-    if on_host is not None:
-        parsed = _parse_version(on_host)
-        if parsed:
-            return parsed
+def _version_from_binary(binary: Path, *, trusted: bool) -> str | None:
+    """Ask the binary for its version.
 
+    Determining the version means executing the artifact, so where that happens matters. A
+    binary that was just downloaded from a URL runs **in a container first** — running it on
+    the host would make ``chlab up -c http://…`` remote code execution on the host, which is
+    exactly the isolation the rest of the design is built on.
+
+    A binary the user already had on disk (``trusted``) is run on the host first instead:
+    they chose that file, and requiring Docker to read a local build's version would break
+    working offline. The result is cached either way, so the cost is one container start.
+    """
+    attempts = [_host_probe, _container_probe]
+    if not trusted:
+        attempts.reverse()
+
+    for attempt in attempts:
+        output = attempt(binary)
+        if output:
+            parsed = _parse_version(output)
+            if parsed:
+                return parsed
+    return None
+
+
+def _host_probe(binary: Path) -> str | None:
+    return _run([str(binary), "server", "--version"], timeout=VERSION_TIMEOUT)
+
+
+def _container_probe(binary: Path) -> str | None:
     if not _docker_available():
         return None
-
-    mount = f"{binary.resolve()}:/{program}:ro"
-    in_container = _run(
+    return _run(
         [
-            "docker", "run", "--rm", "--pull", "missing",
-            "-v", mount, "--entrypoint", f"/{program}",
-            VERSION_PROBE_IMAGE, "server", "--version",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--pull",
+            "missing",
+            "-v",
+            f"{binary.resolve()}:/{PROGRAM}:ro",
+            "--entrypoint",
+            f"/{PROGRAM}",
+            VERSION_PROBE_IMAGE,
+            "server",
+            "--version",
         ],
         timeout=VERSION_TIMEOUT,
     )
-    return _parse_version(in_container) if in_container else None
 
 
-def _version_from_image(image: str, program: str) -> str | None:
+def _version_from_image(image: str) -> str | None:
     output = _run(
-        ["docker", "run", "--rm", "--entrypoint", f"/usr/bin/{program}", image, "server", "--version"],
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            f"/usr/bin/{PROGRAM}",
+            image,
+            "server",
+            "--version",
+        ],
         timeout=VERSION_TIMEOUT,
     )
     return _parse_version(output) if output else None
@@ -242,11 +301,19 @@ def _parse_version(output: str) -> str | None:
     return match.group(1).strip(".")
 
 
-def _cached_version(cache: Cache, key: str, program: str, force: bool) -> str | None:
+def _is_floating_tag(image: str) -> bool:
+    """True for tags that move, where a cached local image may not be what the registry serves."""
+    _, _, tag = image.rpartition(":")
+    if not tag or "/" in tag:
+        return True  # no tag at all means :latest
+    return version_from_image_tag(image) is None
+
+
+def _cached_version(cache: Cache, key: str, force: bool) -> str | None:
     if force:
         return None
     meta = cache.read_meta(key)
-    if not meta or meta.get("program") != program:
+    if not meta:
         return None
     return meta.get("version")
 
@@ -255,7 +322,6 @@ def _write_meta(
     cache: Cache,
     key: str,
     source: Source,
-    program: str,
     version: str | None,
     *,
     docker_image: str | None = None,
@@ -266,7 +332,7 @@ def _write_meta(
         {
             "source": source.raw,
             "kind": source.kind.value,
-            "program": program,
+            "program": PROGRAM,
             "version": version,
             "docker_image": docker_image,
             "binary_path": str(binary_path) if binary_path else None,
@@ -302,7 +368,9 @@ def _pull_image(image: str) -> None:
         timeout=PULL_TIMEOUT,
     )
     if result.returncode != 0:
-        raise ResolveError(f"could not pull {image}: {result.stderr.strip() or result.stdout.strip()}")
+        raise ResolveError(
+            f"could not pull {image}: {result.stderr.strip() or result.stdout.strip()}"
+        )
 
 
 def _run(command: list[str], *, timeout: int = 60) -> str | None:

@@ -4,7 +4,7 @@ import pytest
 
 from chlab.core.ports import allocate_block, is_free
 from chlab.core.spec import ClusterSpec
-from chlab.core.topology import build_topology, port_span
+from chlab.core.topology import UnknownNode, build_topology, port_span
 
 
 def topology(shards=1, replicas=1, keeper_nodes=None, port_base=21000):
@@ -22,7 +22,9 @@ def topology(shards=1, replicas=1, keeper_nodes=None, port_base=21000):
 
 def test_nodes_fill_shard_by_shard():
     """clickhouse1/2 are the replicas of shard 1, clickhouse3/4 of shard 2."""
-    layout = [(node.name, node.shard, node.replica) for node in topology(shards=2, replicas=2).nodes]
+    layout = [
+        (node.name, node.shard, node.replica) for node in topology(shards=2, replicas=2).nodes
+    ]
     assert layout == [
         ("clickhouse1", 1, 1),
         ("clickhouse2", 1, 2),
@@ -32,7 +34,9 @@ def test_nodes_fill_shard_by_shard():
 
 
 def test_shard_layout_groups_replicas():
-    grouped = [[node.name for node in shard] for shard in topology(shards=2, replicas=2).shard_layout()]
+    grouped = [
+        [node.name for node in shard] for shard in topology(shards=2, replicas=2).shard_layout()
+    ]
     assert grouped == [["clickhouse1", "clickhouse2"], ["clickhouse3", "clickhouse4"]]
 
 
@@ -76,7 +80,7 @@ def test_topology_requires_allocated_ports():
 
 
 def test_node_lookup_reports_unknown_names():
-    with pytest.raises(KeyError):
+    with pytest.raises(UnknownNode, match="clickhouse9"):
         topology().node("clickhouse9")
 
 

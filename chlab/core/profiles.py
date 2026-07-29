@@ -14,14 +14,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .spec import ClusterSpec, DatabaseSpec, UserSpec
+from .errors import ChlabError
+from .spec import ClusterSpec, DatabaseSpec, UserSpec, construct
 
 ENV_CONFIG_DIR = "CHLAB_CONFIG_DIR"
 #: Fields a profile never carries, because they identify a particular instance.
 INSTANCE_FIELDS = frozenset({"name", "source", "version", "port_base"})
 
 
-class ProfileNotFound(KeyError):
+class ProfileNotFound(ChlabError):
     def __init__(self, name: str):
         super().__init__(name)
         self.name = name
@@ -44,7 +45,7 @@ class Profiles:
     root: Path
 
     @classmethod
-    def default(cls) -> "Profiles":
+    def default(cls) -> Profiles:
         return cls(default_config_dir())
 
     @property
@@ -61,6 +62,7 @@ class Profiles:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.part")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        tmp.chmod(0o600)  # profiles carry user passwords too
         tmp.replace(self.path)
 
     def names(self) -> list[str]:
@@ -96,14 +98,19 @@ def apply(profile: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     merged.update({key: value for key, value in overrides.items() if value is not None})
     if "users" in merged:
         merged["users"] = tuple(
-            user if isinstance(user, UserSpec) else UserSpec(**user) for user in merged["users"]
+            user if isinstance(user, UserSpec) else construct(UserSpec, user)
+            for user in merged["users"]
         )
     if "databases" in merged:
         merged["databases"] = tuple(
-            database if isinstance(database, DatabaseSpec) else DatabaseSpec(**database)
+            database if isinstance(database, DatabaseSpec) else construct(DatabaseSpec, database)
             for database in merged["databases"]
         )
-    return merged
+    # A profile written by a newer chlab may carry fields this version has never heard of.
+    # Dropping them here keeps `--profile` working instead of raising TypeError at the
+    # ClusterSpec constructor.
+    known = set(ClusterSpec.__dataclass_fields__)
+    return {key: value for key, value in merged.items() if key in known}
 
 
 def summarise(profile: dict[str, Any]) -> str:

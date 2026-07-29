@@ -104,11 +104,15 @@ def base_config() -> dict[str, Any]:
         "default_database": "default",
         "timezone": "UTC",
         "mlock_executable": "false",
-        "mark_cache_size": 5368709120,
-        "max_connections": 4096,
+        # Lab-scale, not server-scale. The stock defaults (5 GiB / 8 GiB) assume one server
+        # owns the machine; chlab's whole point is several clusters of several nodes side by
+        # side on a laptop. --setting overrides any of this.
+        "mark_cache_size": 268435456,
+        "uncompressed_cache_size": 536870912,
+        "max_server_memory_usage_to_ram_ratio": 0.3,
+        "max_connections": 1024,
         "max_concurrent_queries": 100,
         "keep_alive_timeout": 3,
-        "uncompressed_cache_size": 8589934592,
     }
 
 

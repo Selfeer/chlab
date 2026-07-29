@@ -7,17 +7,20 @@ through here, and a local tool should not need a driver to run ``SELECT 1``.
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from .errors import ChlabError
+
 DEFAULT_TIMEOUT = 60
 DEFAULT_FORMAT = "JSONCompact"
 
 
-class QueryError(RuntimeError):
+class QueryError(ChlabError):
     """A query the server rejected, carrying the server's own message."""
 
     def __init__(self, message: str, *, node: str | None = None):
@@ -135,8 +138,6 @@ def keeper_ok(port: int, *, host: str = "127.0.0.1", timeout: float = 2.0) -> bo
     Keeper binds its client port only after the Raft election settles, so a plain TCP connect
     is not enough to know it will serve requests.
     """
-    import socket
-
     try:
         with socket.create_connection((host, port), timeout=timeout) as connection:
             connection.sendall(b"ruok")

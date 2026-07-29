@@ -18,6 +18,12 @@ DEMO_DATABASE = "demo"
 DEMO_TABLE = "events_local"
 DEMO_DISTRIBUTED = "events"
 DEMO_ROWS = 100_000
+#: Sharding expression of the Distributed table. The seed inserts must place each row on the
+#: shard this expression selects, or `optimize_skip_unused_shards=1` silently drops rows —
+#: a trap in a tool whose job is checking whether a build behaves correctly.
+SHARDING_KEY = "cityHash64(user_id)"
+#: How user_id is generated, so the insert can evaluate SHARDING_KEY over the same values.
+USER_ID_EXPRESSION = "toUInt32(cityHash64(number) % 10000)"
 
 
 @dataclass
@@ -66,8 +72,11 @@ ROLE_GRANTS = {
 
 
 def user_statements(user: UserSpec) -> list[str]:
+    # sha256_password rather than plaintext_password: the server stores only a hash, so the
+    # cleartext never reaches its access storage. Clients still authenticate with the password
+    # the user chose — ClickHouse hashes it on arrival.
     identified = (
-        f"IDENTIFIED WITH plaintext_password BY {_quote(user.password)}"
+        f"IDENTIFIED WITH sha256_password BY {_quote(user.password)}"
         if user.password
         else "IDENTIFIED WITH no_password"
     )
@@ -77,6 +86,9 @@ def user_statements(user: UserSpec) -> list[str]:
     if privileges:
         suffix = " WITH GRANT OPTION" if user.is_admin else ""
         statements.append(f"GRANT {privileges} ON *.* TO {_ident(user.name)}{suffix}")
+    # Grants are interpolated verbatim, on purpose: the whole point is arbitrary privilege
+    # expressions, and anyone who can pass one can already run arbitrary SQL. The _ident and
+    # _quote helpers below cover the values that are *not* meant to be expressions.
     for grant in user.grants:
         statements.append(f"GRANT {grant} TO {_ident(user.name)}")
 
@@ -116,17 +128,20 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY (event_type, user_id, event_time)""",
         f"""CREATE TABLE IF NOT EXISTS {DEMO_DATABASE}.{DEMO_DISTRIBUTED}
 AS {DEMO_DATABASE}.{DEMO_TABLE}
-ENGINE = Distributed({_quote(spec.cluster_name)}, {DEMO_DATABASE}, {DEMO_TABLE}, cityHash64(user_id))""",
+ENGINE = Distributed({_quote(spec.cluster_name)}, {DEMO_DATABASE}, {DEMO_TABLE}, {SHARDING_KEY})""",
     ]
 
 
 def seed_inserts(topology: Topology, rows: int = DEMO_ROWS) -> dict[str, str]:
     """One insert per shard, run on that shard's first replica.
 
-    Each shard takes a disjoint slice of the generated rows, so the Distributed table sees
-    every row exactly once no matter how the cluster is laid out.
+    Each shard takes a disjoint slice of the generated rows, selected by the *same* expression
+    the Distributed table shards on. Splitting by `number % shards` instead would be simpler
+    and would still total correctly, but rows would sit on shards the sharding key says they
+    are not on, and `optimize_skip_unused_shards=1` would then return partial results.
     """
     shards = topology.spec.shards
+    placement = SHARDING_KEY.replace("user_id", USER_ID_EXPRESSION)
     inserts = {}
     for shard_nodes in topology.shard_layout():
         if not shard_nodes:
@@ -135,12 +150,12 @@ def seed_inserts(topology: Topology, rows: int = DEMO_ROWS) -> dict[str, str]:
         inserts[writer.name] = f"""INSERT INTO {DEMO_DATABASE}.{DEMO_TABLE}
 SELECT
     now() - toIntervalSecond(intDiv(number, 4)) AS event_time,
-    toUInt32(cityHash64(number) %% 10000) AS user_id,
+    {USER_ID_EXPRESSION} AS user_id,
     ['view', 'click', 'purchase', 'signup'][toUInt8(number %% 4) + 1] AS event_type,
     ['GE', 'US', 'DE', 'NL', 'JP'][toUInt8(cityHash64(number, 2) %% 5) + 1] AS country,
     round(cityHash64(number, 1) %% 100000 / 100, 2) AS value
 FROM numbers({rows})
-WHERE number %% {shards} = {writer.shard - 1}""".replace("%%", "%")
+WHERE {placement} %% {shards} = {writer.shard - 1}""".replace("%%", "%")
     return inserts
 
 

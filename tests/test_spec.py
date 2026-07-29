@@ -90,14 +90,22 @@ def test_parse_user_reads_password_and_role():
     assert user.is_admin
 
 
-def test_parse_user_rejects_unknown_role():
+def test_parse_user_keeps_colons_in_passwords():
+    """Only a known role name in the last field is treated as a role."""
+    assert parse_user("dev:p:ss").password == "p:ss"
+    assert parse_user("dev:p:ss").role == "readwrite"
+    assert parse_user("dev:p:ss:admin").password == "p:ss"
+    assert parse_user("dev:p:ss:admin").role == "admin"
+
+
+def test_parse_user_rejects_an_unknown_role_given_alone():
+    """A single trailing field that is not a role is a password, not a typo'd role."""
+    assert parse_user("dev:wizard").password == "wizard"
+
+
+def test_user_spec_rejects_an_unknown_role():
     with pytest.raises(SpecError, match="unknown role"):
-        parse_user("dev:secret:wizard")
-
-
-def test_parse_user_rejects_extra_fields():
-    with pytest.raises(SpecError, match="name\\[:password\\]"):
-        parse_user("a:b:admin:d")
+        UserSpec("dev", role="wizard")
 
 
 def test_parse_grant_splits_on_the_first_colon():
@@ -137,3 +145,28 @@ def test_suggest_name_prefers_versions(source, expected):
 def test_suggest_name_avoids_collisions():
     source = "docker://x/y:24.8.1.1"
     assert suggest_name(source, taken={"ch-24-8-1-1"}) == "ch-24-8-1-1-2"
+
+
+def test_every_chlab_exception_inherits_the_base_class():
+    """The CLI catches ChlabError and nothing else.
+
+    An exception that escapes the hierarchy reaches the user as a traceback — which is exactly
+    what happened to QueryError when the hierarchy was introduced. Asserting the invariant here
+    means the next one cannot slip through.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+
+    import chlab.core
+    from chlab.core.errors import ChlabError
+
+    stray = []
+    for module_info in pkgutil.iter_modules(chlab.core.__path__):
+        module = importlib.import_module(f"chlab.core.{module_info.name}")
+        for name, obj in vars(module).items():
+            if not inspect.isclass(obj) or obj.__module__ != module.__name__:
+                continue
+            if issubclass(obj, BaseException) and not issubclass(obj, ChlabError):
+                stray.append(f"{module.__name__}.{name}")
+    assert stray == [], f"these exceptions do not inherit ChlabError: {stray}"

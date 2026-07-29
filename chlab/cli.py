@@ -6,32 +6,37 @@ import hashlib
 import json as jsonlib
 import os
 import shutil
-from typing import Annotated, Optional
+from dataclasses import replace
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
-from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn, TransferSpeedColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TransferSpeedColumn,
+)
 from rich.table import Table
 
 from .core import profiles as profiles_module
 from .core.cache import Cache
-from .core.download import DownloadError
-from .core.image import ImageError
-from .core.ports import NoFreePorts
+from .core.errors import ChlabError
 from .core.query import QueryError, QueryResult
-from .core.registry import InstanceExists, InstanceNotFound, Registry
-from .core.resolve import DEFAULT_PROGRAM, Resolved, ResolveError, resolve
-from .core.runtime import InitError, InstanceStatus, Runtime, RuntimeError_
+from .core.registry import Registry
+from .core.resolve import Resolved, resolve
+from .core.runtime import InstanceStatus, Runtime
 from .core.spec import (
     ClusterSpec,
     SpecError,
     parse_database,
     parse_grant,
+    parse_setting,
     parse_user,
     suggest_name,
 )
-from .core.sources import UnsupportedSource
-from .core.unpack import UnpackError
 
 app = typer.Typer(
     help="Run any ClickHouse build, immediately.",
@@ -45,22 +50,6 @@ app.add_typer(profiles_app, name="profiles")
 
 console = Console()
 error_console = Console(stderr=True)
-
-CHLAB_ERRORS = (
-    ResolveError,
-    UnsupportedSource,
-    DownloadError,
-    UnpackError,
-    SpecError,
-    RuntimeError_,
-    InitError,
-    ImageError,
-    NoFreePorts,
-    QueryError,
-    InstanceExists,
-    InstanceNotFound,
-    profiles_module.ProfileNotFound,
-)
 
 JsonOption = Annotated[bool, typer.Option("--json", help="Emit JSON instead of a table.")]
 NameArgument = Annotated[str, typer.Argument(metavar="NAME", help="Instance name.")]
@@ -79,10 +68,13 @@ def resolve_command(
         ),
     ],
     version: Annotated[
-        Optional[str], typer.Option("--clickhouse-version", help="Skip detection and use this version.")
+        str | None,
+        typer.Option("--clickhouse-version", help="Skip detection and use this version."),
     ] = None,
     force: Annotated[bool, typer.Option("--force", "-f", help="Ignore the cache.")] = False,
-    program: Annotated[str, typer.Option("--program", hidden=True)] = DEFAULT_PROGRAM,
+    sha256: Annotated[
+        str | None, typer.Option("--sha256", help="Verify the download against this checksum.")
+    ] = None,
     json: JsonOption = False,
 ) -> None:
     """Resolve a ClickHouse source to a runnable image or binary."""
@@ -90,13 +82,13 @@ def resolve_command(
         try:
             resolved = resolve(
                 source,
-                program=program,
                 version=version,
                 force=force,
+                sha256=sha256,
                 on_event=report.event,
                 on_progress=report.progress,
             )
-        except CHLAB_ERRORS as failure:
+        except ChlabError as failure:
             _fail(failure)
 
     if json:
@@ -141,10 +133,41 @@ def cache_ls(json: JsonOption = False) -> None:
     table = Table(box=None, padding=(0, 2, 0, 0))
     table.add_column("VERSION", style="bold")
     table.add_column("KIND")
+    table.add_column("SIZE", justify="right")
     table.add_column("SOURCE", overflow="fold")
     for entry in sorted(entries, key=lambda item: item.get("version") or ""):
-        table.add_row(entry.get("version") or "unknown", entry.get("kind", ""), entry.get("source", ""))
+        table.add_row(
+            entry.get("version") or "unknown",
+            entry.get("kind", ""),
+            _human_size(_entry_size(cache, entry)),
+            entry.get("source", ""),
+        )
     console.print(table)
+    console.print(f"[dim]{cache.root}[/dim]")
+
+
+@cache_app.command("rm")
+def cache_rm(
+    which: Annotated[str, typer.Argument(help="Version or source substring to remove.")],
+) -> None:
+    """Remove one cached artifact, so a bad download can be re-fetched on its own."""
+    cache = Cache.default()
+    removed = []
+    for meta_file in sorted((cache.root / "bin").glob("*/meta.json")):
+        try:
+            entry = jsonlib.loads(meta_file.read_text())
+        except (OSError, jsonlib.JSONDecodeError):
+            continue
+        if which not in (entry.get("version") or "") and which not in entry.get("source", ""):
+            continue
+        key = meta_file.parent.name
+        for directory in (cache.bin_dir(key), cache.artifact_dir(key)):
+            shutil.rmtree(directory, ignore_errors=True)
+        removed.append(entry.get("version") or key)
+
+    if not removed:
+        _fail(SpecError(f"nothing cached matches {which!r}; see `chlab cache ls`"))
+    console.print(f"removed {', '.join(removed)}")
 
 
 @cache_app.command("clear")
@@ -176,21 +199,25 @@ def up_command(
         ),
     ],
     name: Annotated[
-        Optional[str], typer.Option("--name", "-n", help="Instance name. Derived from the version if omitted.")
+        str | None,
+        typer.Option("--name", "-n", help="Instance name. Derived from the version if omitted."),
     ] = None,
     version: Annotated[
-        Optional[str], typer.Option("--clickhouse-version", help="Skip detection and use this version.")
+        str | None,
+        typer.Option("--clickhouse-version", help="Skip detection and use this version."),
     ] = None,
-    shards: Annotated[Optional[int], typer.Option("--shards", "-s", help="Number of shards.")] = None,
+    shards: Annotated[int | None, typer.Option("--shards", "-s", help="Number of shards.")] = None,
     replicas: Annotated[
-        Optional[int], typer.Option("--replicas", "-r", help="Replicas per shard.")
+        int | None, typer.Option("--replicas", "-r", help="Replicas per shard.")
     ] = None,
     keeper: Annotated[
-        Optional[int],
-        typer.Option("--keeper", "-k", help="Keeper nodes. Defaults to 1 when replicating, else 0."),
+        int | None,
+        typer.Option(
+            "--keeper", "-k", help="Keeper nodes. Defaults to 1 when replicating, else 0."
+        ),
     ] = None,
     user: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "--user",
             "-u",
@@ -199,64 +226,82 @@ def up_command(
         ),
     ] = None,
     grant: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--grant", help="Extra grant: user:PRIVILEGES ON target. Repeatable."),
     ] = None,
     database: Annotated[
-        Optional[list[str]],
-        typer.Option("--database", "-d", help="Create a database: name[:Atomic|Replicated]. Repeatable."),
+        list[str] | None,
+        typer.Option(
+            "--database", "-d", help="Create a database: name[:Atomic|Replicated]. Repeatable."
+        ),
     ] = None,
     setting: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--setting", help="Server setting as key=value. Repeatable."),
     ] = None,
     seed: Annotated[
-        bool, typer.Option("--seed", help="Create the demo database with generated rows.")
-    ] = False,
+        bool | None,
+        typer.Option(
+            "--seed/--no-seed",
+            help="Create the demo database with generated rows. --no-seed overrides a profile.",
+        ),
+    ] = None,
     cluster_name: Annotated[
-        Optional[str], typer.Option("--cluster-name", help="Name of the generated cluster.")
+        str | None, typer.Option("--cluster-name", help="Name of the generated cluster.")
     ] = None,
     profile: Annotated[
-        Optional[str], typer.Option("--profile", "-p", help="Start from a saved profile.")
+        str | None, typer.Option("--profile", "-p", help="Start from a saved profile.")
     ] = None,
     force_resolve: Annotated[
         bool, typer.Option("--force-resolve", help="Re-download the source, ignoring the cache.")
+    ] = False,
+    sha256: Annotated[
+        str | None, typer.Option("--sha256", help="Verify the download against this checksum.")
+    ] = None,
+    recreate: Annotated[
+        bool,
+        typer.Option("--recreate", help="Reuse an existing instance's name, ports and volumes."),
     ] = False,
 ) -> None:
     """Launch a ClickHouse cluster."""
     runtime = Runtime()
     registry = runtime.registry
 
-    overrides: dict = {
-        "shards": shards,
-        "replicas": replicas,
-        "keeper_nodes": keeper,
-        "cluster_name": cluster_name,
-        "seed": seed or None,
-    }
-    if user:
-        overrides["users"] = _users_with_grants(user, grant or [])
-    elif grant:
-        _fail(SpecError("--grant needs a matching --user"))
-    if database:
-        overrides["databases"] = tuple(parse_database(text) for text in database)
-    if setting:
-        overrides["settings"] = dict(_parse_setting(text) for text in setting)
-
     try:
+        overrides: dict = {
+            "shards": shards,
+            "replicas": replicas,
+            "keeper_nodes": keeper,
+            "cluster_name": cluster_name,
+            "seed": seed,
+        }
+        if user:
+            overrides["users"] = _users_with_grants(user, grant or [])
+        elif grant:
+            raise SpecError("--grant needs a matching --user")
+        if database:
+            overrides["databases"] = tuple(parse_database(text) for text in database)
+        if setting:
+            overrides["settings"] = dict(parse_setting(text) for text in setting)
+
         base = profiles_module.Profiles.default().get(profile) if profile else {}
         fields = profiles_module.apply(base, overrides)
-        instance_name = name or suggest_name(
-            clickhouse, taken={spec.name for spec in registry.list()}
-        )
+        taken = set() if recreate else {spec.name for spec in registry.list()}
+        instance_name = name or suggest_name(clickhouse, taken=taken)
         spec = ClusterSpec(name=instance_name, source=clickhouse, version=version, **fields)
-    except CHLAB_ERRORS as failure:
+    except ChlabError as failure:
         _fail(failure)
 
     with _download_progress() as report:
         try:
-            status = runtime.up(spec, force_resolve=force_resolve, on_event=report.event)
-        except CHLAB_ERRORS as failure:
+            status = runtime.up(
+                spec,
+                force_resolve=force_resolve,
+                recreate=recreate,
+                sha256=sha256,
+                on_event=report.event,
+            )
+        except ChlabError as failure:
             _fail(failure)
 
     console.print()
@@ -299,7 +344,7 @@ def status_command(name: NameArgument, json: JsonOption = False) -> None:
     """Show one instance in detail."""
     try:
         status = Runtime().status(name)
-    except CHLAB_ERRORS as failure:
+    except ChlabError as failure:
         _fail(failure)
 
     if json:
@@ -318,10 +363,10 @@ def stop_command(name: NameArgument) -> None:
 def start_command(name: NameArgument) -> None:
     """Start a stopped instance."""
     runtime = Runtime()
-    with _spinner("starting"):
+    with _spinner("starting") as report:
         try:
-            status = runtime.start(name)
-        except CHLAB_ERRORS as failure:
+            status = runtime.start(name, on_event=report.event)
+        except ChlabError as failure:
             _fail(failure)
     console.print()
     _print_instance(status)
@@ -348,7 +393,7 @@ def rm_command(
 def logs_command(
     name: NameArgument,
     service: Annotated[
-        Optional[str], typer.Argument(help="Node or keeper name. Defaults to all services.")
+        str | None, typer.Argument(help="Node or keeper name. Defaults to all services.")
     ] = None,
     follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream new output.")] = False,
     tail: Annotated[int, typer.Option("--tail", help="Lines of history to show.")] = 200,
@@ -357,7 +402,7 @@ def logs_command(
     runtime = Runtime()
     try:
         code = runtime.logs(name, service, follow=follow, tail=tail)
-    except CHLAB_ERRORS as failure:
+    except ChlabError as failure:
         _fail(failure)
     raise typer.Exit(code=code)
 
@@ -369,13 +414,13 @@ def logs_command(
 def query_command(
     name: NameArgument,
     sql: Annotated[str, typer.Argument(help="SQL to run.")],
-    node: Annotated[Optional[str], typer.Option("--node", help="Run on this node.")] = None,
+    node: Annotated[str | None, typer.Option("--node", help="Run on this node.")] = None,
     all_nodes: Annotated[
         bool, typer.Option("--all", "-a", help="Run on every node and compare the results.")
     ] = False,
     user: Annotated[str, typer.Option("--user", "-u", help="ClickHouse user.")] = "default",
     password: Annotated[str, typer.Option("--password", help="ClickHouse password.")] = "",
-    database: Annotated[Optional[str], typer.Option("--database", "-d")] = None,
+    database: Annotated[str | None, typer.Option("--database", "-d")] = None,
     json: JsonOption = False,
 ) -> None:
     """Run SQL against an instance."""
@@ -384,8 +429,10 @@ def query_command(
         if all_nodes:
             results = runtime.query_all(name, sql, user=user, password=password, database=database)
         else:
-            results = [runtime.query(name, sql, node=node, user=user, password=password, database=database)]
-    except CHLAB_ERRORS as failure:
+            results = [
+                runtime.query(name, sql, node=node, user=user, password=password, database=database)
+            ]
+    except ChlabError as failure:
         _fail(failure)
 
     if json:
@@ -407,13 +454,15 @@ def query_command(
 @app.command("client")
 def client_command(
     name: NameArgument,
-    node: Annotated[Optional[str], typer.Argument(help="Node to connect to. Defaults to the first.")] = None,
+    node: Annotated[
+        str | None, typer.Argument(help="Node to connect to. Defaults to the first.")
+    ] = None,
 ) -> None:
     """Open an interactive clickhouse-client session on a node."""
     runtime = Runtime()
     try:
         command = runtime.client_command(name, node)
-    except (KeyError, *CHLAB_ERRORS) as failure:
+    except ChlabError as failure:
         _fail(failure)
     # Hand the terminal over so the REPL behaves exactly as it would run directly.
     os.execvp(command[0], command)
@@ -430,7 +479,9 @@ def profiles_ls(json: JsonOption = False) -> None:
         console.print_json(jsonlib.dumps(saved))
         return
     if not saved:
-        console.print("[dim]no profiles; save one with `chlab profiles save <name> <instance>`[/dim]")
+        console.print(
+            "[dim]no profiles; save one with `chlab profiles save <name> <instance>`[/dim]"
+        )
         return
 
     table = Table(box=None, padding=(0, 2, 0, 0))
@@ -450,7 +501,7 @@ def profiles_save(
     try:
         spec = Registry().load(instance)
         profiles_module.Profiles.default().save(profile_name, spec)
-    except CHLAB_ERRORS as failure:
+    except ChlabError as failure:
         _fail(failure)
     console.print(f"saved profile [bold]{profile_name}[/bold] from {instance}")
 
@@ -460,7 +511,7 @@ def profiles_rm(profile_name: Annotated[str, typer.Argument(help="Profile to del
     """Delete a profile."""
     try:
         profiles_module.Profiles.default().delete(profile_name)
-    except CHLAB_ERRORS as failure:
+    except ChlabError as failure:
         _fail(failure)
     console.print(f"deleted profile {profile_name}")
 
@@ -477,14 +528,16 @@ def ui_command(
     ] = True,
 ) -> None:
     """Serve the web interface."""
-    try:
-        import uvicorn
+    import uvicorn
 
-        from .web.app import create_app
-    except ImportError:
-        _fail(RuntimeError("the web interface needs fastapi and uvicorn; pip install 'chlab[web]'"))
+    from .web.app import create_app
 
     url = f"http://{host}:{port}"
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        error_console.print(
+            f"[bold yellow]warning:[/bold yellow] binding to {host} exposes an unauthenticated "
+            "API that runs SQL and deletes clusters to everyone who can reach this machine."
+        )
     console.print(f"chlab ui on [bold]{url}[/bold]")
     if open_browser:
         import threading
@@ -516,7 +569,8 @@ class _Report:
 
 
 class _ProgressContext:
-    def __init__(self, disabled: bool = False):
+    def __init__(self, disabled: bool = False, description: str = "working"):
+        self._description = description
         self._progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -530,7 +584,7 @@ class _ProgressContext:
 
     def __enter__(self) -> _Report:
         self._progress.start()
-        task = self._progress.add_task("working", total=None)
+        task = self._progress.add_task(self._description, total=None)
         self._report = _Report(self._progress, task)
         return self._report
 
@@ -543,7 +597,7 @@ def _download_progress(disabled: bool = False) -> _ProgressContext:
 
 
 def _spinner(description: str) -> _ProgressContext:
-    return _ProgressContext()
+    return _ProgressContext(description=description)
 
 
 def _print_instance(status: InstanceStatus) -> None:
@@ -592,7 +646,7 @@ def _print_result(result: QueryResult) -> None:
 
     table = Table(box=None, padding=(0, 2, 0, 0))
     for column in result.columns:
-        table.add_column(column, style="bold" if False else None)
+        table.add_column(column)
     for row in result.rows:
         table.add_row(*[_cell(value) for value in row])
     console.print(table)
@@ -637,6 +691,36 @@ def _cell(value) -> str:
     return str(value)
 
 
+def _entry_size(cache: Cache, entry: dict) -> int:
+    key = None
+    for meta_file in (cache.root / "bin").glob("*/meta.json"):
+        if meta_file.parent.name and entry.get("source") and meta_file.is_file():
+            try:
+                if jsonlib.loads(meta_file.read_text()).get("source") == entry["source"]:
+                    key = meta_file.parent.name
+                    break
+            except (OSError, jsonlib.JSONDecodeError):
+                continue
+    if key is None:
+        return 0
+    total = 0
+    for directory in (cache.bin_dir(key), cache.artifact_dir(key)):
+        for path in directory.rglob("*"):
+            if path.is_file():
+                total += path.stat().st_size
+    return total
+
+
+def _human_size(size: int) -> str:
+    if not size:
+        return "-"
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"
+
+
 def _kv_table() -> Table:
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_column(style="bold")
@@ -645,8 +729,6 @@ def _kv_table() -> Table:
 
 def _users_with_grants(users: list[str], grants: list[str]) -> tuple:
     """Attach each ``--grant user:...`` to the matching ``--user``."""
-    from dataclasses import replace
-
     parsed = {spec.name: spec for spec in (parse_user(text) for text in users)}
     for text in grants:
         name, grant = parse_grant(text)
@@ -656,19 +738,12 @@ def _users_with_grants(users: list[str], grants: list[str]) -> tuple:
     return tuple(parsed.values())
 
 
-def _parse_setting(text: str) -> tuple[str, str]:
-    key, separator, value = text.partition("=")
-    if not separator:
-        raise SpecError(f"setting {text!r} must be written key=value")
-    return key.strip(), value.strip()
-
-
 def _lifecycle(action, message: str) -> None:
     runtime = Runtime()
     with _spinner("working"):
         try:
             action(runtime)
-        except CHLAB_ERRORS as failure:
+        except ChlabError as failure:
             _fail(failure)
     console.print(message)
 
@@ -709,7 +784,7 @@ def _status_as_dict(status: InstanceStatus) -> dict:
             {"name": keeper.name, "port": keeper.client_port} for keeper in status.topology.keepers
         ],
         "services": [
-            {"name": service.name, "state": service.state} for service in status.services
+            {"name": service.name, "state": service.state} for service in status.services or ()
         ],
     }
 
@@ -727,7 +802,7 @@ def _result_as_dict(result) -> dict:
     }
 
 
-def _fail(failure: Exception) -> None:
+def _fail(failure: Exception) -> NoReturn:
     error_console.print(f"[bold red]error:[/bold red] {failure}")
     raise typer.Exit(code=1)
 

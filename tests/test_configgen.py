@@ -31,7 +31,9 @@ def test_remote_servers_lists_every_replica_under_its_shard():
     cluster = root.find("remote_servers/default_cluster")
     shards = cluster.findall("shard")
     assert len(shards) == 2
-    hosts = [[replica.find("host").text for replica in shard.findall("replica")] for shard in shards]
+    hosts = [
+        [replica.find("host").text for replica in shard.findall("replica")] for shard in shards
+    ]
     assert hosts == [["clickhouse1", "clickhouse2"], ["clickhouse3", "clickhouse4"]]
 
 

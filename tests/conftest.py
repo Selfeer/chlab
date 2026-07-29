@@ -83,3 +83,25 @@ def fake_tgz(tmp_path: Path) -> Path:
     )
     path.write_bytes(payload)
     return path
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-docker",
+        action="store_true",
+        default=False,
+        help="Run tests that launch real containers.",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "docker: needs a working Docker daemon")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--run-docker"):
+        return
+    skip = pytest.mark.skip(reason="needs --run-docker")
+    for item in items:
+        if "docker" in item.keywords:
+            item.add_marker(skip)

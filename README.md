@@ -41,6 +41,9 @@ python3 -m venv .venv
 Optional: `pipx install -e ".[zstd]"` if you hit `.deb` packages using zstd compression.
 Without it, chlab falls back to the `zstd` CLI when present.
 
+Resolving a source from the network also pulls `ubuntu:24.04` once, to read the binary's
+version inside a container rather than executing a freshly downloaded file on your host.
+
 ## Quick start
 
 ```bash
@@ -114,6 +117,8 @@ chlab cache       inspect or clear the artifact cache
 | `-p`, `--profile` | Start from a saved topology |
 | `--clickhouse-version` | Skip version detection |
 | `--force-resolve` | Re-download, ignoring the cache |
+| `--sha256` | Verify the download against a checksum |
+| `--recreate` | Relaunch an existing instance in place, keeping its ports and data |
 
 Nodes are named `clickhouse1…N`, filling shard by shard: with `--shards 2 --replicas 2`,
 `clickhouse1`/`clickhouse2` are the replicas of shard 1. Keeper nodes are `keeper1…N` and
@@ -183,6 +188,21 @@ chlab up -c <source> --name tuned \
   --setting max_concurrent_queries=200
 ```
 
+## Where things live
+
+| Path | Contents | Override |
+|---|---|---|
+| `~/.local/state/chlab` | instances: spec, generated configs, compose file | `CHLAB_STATE_DIR` |
+| `~/.cache/chlab` | downloaded artifacts and extracted binaries | `CHLAB_CACHE_DIR` |
+| `~/.config/chlab` | saved profiles | `CHLAB_CONFIG_DIR` |
+
+The overrides are useful for throwaway labs and for running several independently:
+`CHLAB_STATE_DIR=/tmp/lab chlab up -c …`.
+
+`spec.json` and `profiles.json` record the passwords you pass to `--user`, so both are written
+`0600` inside a `0700` directory. Inside the server the passwords are stored hashed
+(`sha256_password`), not in cleartext.
+
 ## Demo data
 
 `--seed` creates, on every node:
@@ -219,12 +239,26 @@ See [SPEC.md](SPEC.md) for the full design and the decisions behind it.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest
+.venv/bin/python -m pytest              # unit tests: no network, no Docker
+.venv/bin/python -m pytest -m docker --run-docker   # end-to-end, launches a real cluster
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-No network, no Docker: the suite builds real `.deb` and `.tgz` archives in a tmpdir, serves
-them from a local HTTP server, and drives the web app against a stubbed runtime.
+The unit suite builds real `.deb` and `.tgz` archives in a tmpdir, serves them from a local HTTP
+server, and drives the web app against a stubbed runtime. The Docker-gated smoke test is the
+only one that exercises the generated `config.xml` against an actual server.
 
 ## Known issues
 
-See [open issues](https://github.com/Selfeer/chlab/issues).
+- The web UI's layout and dark mode have never been visually reviewed
+  ([#1](https://github.com/Selfeer/chlab/issues/1)).
+- `chlab client`'s interactive handoff is untested
+  ([#3](https://github.com/Selfeer/chlab/issues/3)).
+- RPM packages are rejected; only `.deb`, `.tgz`, raw binaries and Docker images work.
+- Port allocation probes then binds, so two launches started in the same instant can collide.
+
+Full list: [open issues](https://github.com/Selfeer/chlab/issues).
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

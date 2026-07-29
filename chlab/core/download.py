@@ -7,11 +7,14 @@ looks like a complete artifact.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
+
+from .errors import ChlabError
 
 CHUNK_SIZE = 1 << 20
 USER_AGENT = "chlab"
@@ -20,7 +23,11 @@ USER_AGENT = "chlab"
 ProgressCallback = Callable[[int, int | None], None]
 
 
-class DownloadError(RuntimeError):
+class DownloadError(ChlabError):
+    pass
+
+
+class ChecksumError(ChlabError):
     pass
 
 
@@ -29,13 +36,17 @@ def download(
     dest: Path,
     *,
     force: bool = False,
+    sha256: str | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Download ``url`` to ``dest``, returning ``dest``.
 
-    An existing, complete ``dest`` is reused unless ``force`` is set.
+    An existing, complete ``dest`` is reused unless ``force`` is set. If ``sha256`` is given,
+    the finished file must match it.
     """
     if dest.exists() and not force:
+        if sha256:
+            verify_sha256(dest, sha256)
         return dest
 
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +65,14 @@ def download(
                     downloaded += len(chunk)
                     if on_progress:
                         on_progress(downloaded, total)
+
+        # http.client does not raise when a body ends short of its Content-Length, so a
+        # connection dropped mid-transfer looks exactly like a completed one. Without this
+        # check the truncated file is renamed into place and cached forever.
+        if total is not None and downloaded != total:
+            raise DownloadError(
+                f"{url} ended after {downloaded} of {total} bytes; the transfer was cut short"
+            )
     except urllib.error.HTTPError as error:
         partial.unlink(missing_ok=True)
         raise DownloadError(f"{url} returned HTTP {error.code} {error.reason}") from error
@@ -64,8 +83,29 @@ def download(
         partial.unlink(missing_ok=True)
         raise
 
+    if sha256:
+        try:
+            verify_sha256(partial, sha256)
+        except ChecksumError:
+            partial.unlink(missing_ok=True)
+            raise
+
     partial.replace(dest)
     return dest
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_sha256(path: Path, expected: str) -> None:
+    actual = sha256_of(path)
+    if actual.lower() != expected.strip().lower():
+        raise ChecksumError(f"{path.name} has sha256 {actual}, expected {expected}")
 
 
 def copy_local(src: Path, dest: Path) -> Path:

@@ -46,7 +46,9 @@ def test_reports_missing_data_member(tmp_path: Path):
 def test_reports_missing_binary(tmp_path: Path):
     package = tmp_path / "empty.deb"
     package.write_bytes(
-        make_ar({"debian-binary": b"2.0\n", "data.tar.gz": make_tar_gz({"./etc/config.xml": b"<x/>"})})
+        make_ar(
+            {"debian-binary": b"2.0\n", "data.tar.gz": make_tar_gz({"./etc/config.xml": b"<x/>"})}
+        )
     )
     with pytest.raises(UnpackError, match="does not contain"):
         extract_binary(package, "clickhouse", tmp_path / "out")

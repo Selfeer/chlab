@@ -6,6 +6,7 @@ Covers the path that matters most in practice: a build-artifact URL pointing at 
 from __future__ import annotations
 
 import functools
+import hashlib
 import http.server
 import threading
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from chlab.core.cache import Cache
-from chlab.core.download import DownloadError, download
+from chlab.core.download import ChecksumError, DownloadError, download
 from chlab.core.resolve import resolve
 from tests.conftest import FAKE_VERSION
 
@@ -66,7 +67,9 @@ def test_download_reports_progress(http_root, tmp_path: Path):
     (root / "payload.bin").write_bytes(b"x" * 4096)
 
     seen: list[tuple[int, int | None]] = []
-    download(f"{base}/payload.bin", tmp_path / "payload.bin", on_progress=lambda *args: seen.append(args))
+    download(
+        f"{base}/payload.bin", tmp_path / "payload.bin", on_progress=lambda *args: seen.append(args)
+    )
 
     assert seen[0] == (0, 4096)
     assert seen[-1] == (4096, 4096)
@@ -85,3 +88,49 @@ def test_failed_download_leaves_nothing_behind(http_root, tmp_path: Path):
         download(f"{base}/absent.deb", dest)
     assert not dest.exists()
     assert not dest.with_name(dest.name + ".part").exists()
+
+
+def test_truncated_download_is_rejected_not_cached(tmp_path: Path):
+    """http.client does not raise on a short body, so a dropped transfer looked complete."""
+    import http.server
+    import threading
+
+    class Liar(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "1000000")
+            self.end_headers()
+            self.wfile.write(b"0123456789")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Liar)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        dest = tmp_path / "short.deb"
+        with pytest.raises(DownloadError, match="cut short"):
+            download(f"http://127.0.0.1:{server.server_port}/x", dest)
+        # Critically, the truncated file must not be left where the cache would reuse it.
+        assert not dest.exists()
+        assert not dest.with_name(dest.name + ".part").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_checksum_mismatch_rejects_the_artifact(http_root, tmp_path: Path):
+    root, base = http_root
+    (root / "payload.bin").write_bytes(b"real content")
+    with pytest.raises(ChecksumError, match="expected"):
+        download(f"{base}/payload.bin", tmp_path / "payload.bin", sha256="0" * 64)
+    assert not (tmp_path / "payload.bin").exists()
+
+
+def test_matching_checksum_is_accepted(http_root, tmp_path: Path):
+    root, base = http_root
+    (root / "payload.bin").write_bytes(b"real content")
+    digest = hashlib.sha256(b"real content").hexdigest()
+    assert download(f"{base}/payload.bin", tmp_path / "payload.bin", sha256=digest).exists()

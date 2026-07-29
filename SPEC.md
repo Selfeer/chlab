@@ -100,7 +100,19 @@ host first (fast, no Docker needed); on failure — wrong architecture, missing 
 retried inside a container. For `docker://` sources it runs inside that image. Parsing the
 version out of a Docker tag is a last-resort fallback only, and warns.
 
-`--clickhouse-version` overrides detection entirely, as in `regression.py`.
+Determining a version means *executing* the artifact, so where that happens matters. A binary
+just fetched from a URL is probed **in a container first** — running it on the host would make
+`chlab up -c http://…` remote code execution on the host. A binary the user already had on disk
+is probed on the host first instead: they chose that file, and requiring Docker to read a local
+build's version would break working offline. Either way the answer is cached.
+
+`--clickhouse-version` overrides detection entirely, as in `regression.py`. `--sha256` verifies
+a download before it is unpacked; plain `http://` sources warn.
+
+Downloads are checked against `Content-Length`. `http.client` does not raise when a body ends
+short, so without that check a connection dropped mid-transfer would be renamed into place and
+cached as a complete artifact forever. Unpacking streams throughout: a 790 MB binary is
+extracted from a 236 MB `.deb` in about 20 MB of RSS.
 
 ---
 
@@ -108,10 +120,17 @@ version out of a Docker tag is a last-resort fallback only, and warns.
 
 **Deviation from the regression repo.** `helpers/cluster.py:1676-1703` runs `docker build` per
 package to bake the binary into a base image. Because `clickhouse-common-static` is a static
-binary, that build is unnecessary: chlab builds **one** base image (Ubuntu + `clickhouse` user +
-standard directories + entrypoint), then bind-mounts the resolved binary read-only at
-`/usr/bin/clickhouse`. Every version reuses the same image, and startup drops from minutes to
-seconds.
+binary, that build is unnecessary: chlab builds **one** base image and bind-mounts the resolved
+binary read-only at `/usr/bin/clickhouse`. Every version reuses the same image, and startup
+drops from minutes to seconds.
+
+The base image is deliberately thin: Ubuntu plus CA certificates, a timezone, and the standard
+ClickHouse directories. It contains no ClickHouse, no stock configuration, **no `clickhouse`
+user, and no entrypoint** — the entrypoint is set per service in the compose file, because
+Keeper and the server run the same binary with different arguments. The server therefore runs
+as root in base-image mode and writes root-owned files into its data volume. For a local lab
+whose volumes are disposable that is an accepted trade, not an oversight; a non-root user would
+also make existing volumes unreadable on upgrade.
 
 Docker-image sources are exempt: those run **as that image**, with only generated configs
 mounted in. If you point chlab at an image, you want to test that image — not a binary ripped
@@ -172,6 +191,21 @@ Keeper's `ruok`, then each server's `/ping`, then a live `system.zookeeper` read
 
 **Role presets.** `--user name[:password][:role]` where role is `none`, `readonly`,
 `readwrite` (the default) or `admin`. `--grant user:PRIVILEGES ON target` adds anything else.
+Users are created `IDENTIFIED WITH sha256_password`, so the server stores a hash rather than the
+cleartext. `spec.json` and `profiles.json` still record the password you chose, so both are
+written `0600` under a `0700` state directory.
+
+**Seed data matches its own sharding key.** The demo inserts place each row on the shard the
+Distributed table's `cityHash64(user_id)` selects. Splitting rows by `number % shards` would
+total correctly but put them on shards the sharding key says they are not on, and
+`optimize_skip_unused_shards=1` would then silently return partial results — a trap in a tool
+whose job is checking whether a build behaves correctly.
+
+**The web UI checks the `Host` header.** Binding to loopback is not a defence against DNS
+rebinding: a page the user visits can point a hostname it controls at `127.0.0.1` and reach the
+API same-origin. The API runs SQL and deletes clusters, so it answers only on loopback names.
+The SQL editor's Ace build is vendored rather than loaded from a CDN, which also makes the UI
+work offline.
 
 ## Possible next steps
 
@@ -179,3 +213,9 @@ Not built, in rough order of usefulness: TLS, S3/MinIO-backed disks, cluster-wid
 DDL as an option, importing real sample datasets, `clickhouse-keeper` as a separate binary
 source, RPM support, and comparing query results across two *instances* rather than across
 nodes of one.
+
+Known limits, stated rather than hidden: port allocation probes and then binds, so two `chlab
+up` runs started in the same instant can still pick the same block; `--setting` writes into
+`config.d` and is not validated against the server's actual setting names, only against what
+can be a valid XML element; and `resolve` needs Docker for network sources, since that is where
+their version is probed.

@@ -16,14 +16,18 @@ import os
 import shutil
 from pathlib import Path
 
+from .errors import ChlabError
 from .spec import ClusterSpec
 from .topology import port_span
 
 ENV_STATE_DIR = "CHLAB_STATE_DIR"
 SPEC_FILENAME = "spec.json"
+#: spec.json records user passwords in cleartext, so it is not world-readable.
+SPEC_MODE = 0o600
+STATE_DIR_MODE = 0o700
 
 
-class InstanceNotFound(KeyError):
+class InstanceNotFound(ChlabError):
     def __init__(self, name: str):
         super().__init__(name)
         self.name = name
@@ -32,7 +36,11 @@ class InstanceNotFound(KeyError):
         return f"no instance named {self.name!r}"
 
 
-class InstanceExists(RuntimeError):
+class InstanceExists(ChlabError):
+    pass
+
+
+class CorruptSpec(ChlabError):
     pass
 
 
@@ -62,9 +70,11 @@ class Registry:
     def save(self, spec: ClusterSpec) -> Path:
         directory = self.instance_dir(spec.name)
         directory.mkdir(parents=True, exist_ok=True)
+        _restrict(self.root)
         path = directory / SPEC_FILENAME
         tmp = path.with_suffix(".json.part")
         tmp.write_text(json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n")
+        tmp.chmod(SPEC_MODE)
         tmp.replace(path)
         return directory
 
@@ -74,6 +84,13 @@ class Registry:
             return ClusterSpec.from_dict(json.loads(path.read_text()))
         except FileNotFoundError as error:
             raise InstanceNotFound(name) from error
+        except json.JSONDecodeError as error:
+            # Without this the instance is listable but not removable: list() skips it while
+            # status/stop/rm all traceback.
+            raise CorruptSpec(
+                f"{path} is not readable JSON ({error}); "
+                f"delete the directory to forget this instance: {self.instance_dir(name)}"
+            ) from error
 
     def list(self) -> list[ClusterSpec]:
         if not self.instances_dir.is_dir():
@@ -82,7 +99,7 @@ class Registry:
         for directory in sorted(self.instances_dir.iterdir()):
             try:
                 specs.append(self.load(directory.name))
-            except (InstanceNotFound, json.JSONDecodeError, TypeError):
+            except (ChlabError, json.JSONDecodeError, TypeError, ValueError):
                 continue
         return specs
 
@@ -100,3 +117,11 @@ class Registry:
                 continue
             taken.update(range(spec.port_base, spec.port_base + port_span(spec)))
         return taken
+
+
+def _restrict(path: Path) -> None:
+    """Keep the state tree private; it holds cleartext passwords."""
+    try:
+        path.chmod(STATE_DIR_MODE)
+    except OSError:
+        pass

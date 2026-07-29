@@ -10,8 +10,9 @@ from __future__ import annotations
 import threading
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclass
@@ -31,7 +32,9 @@ class Job:
             "kind": self.kind,
             "target": self.target,
             "status": self.status,
-            "events": self.events,
+            # A copy: the worker thread appends to this list under the lock, and the
+            # response is serialised outside it.
+            "events": list(self.events),
             "error": self.error,
             "detail": self.detail,
         }

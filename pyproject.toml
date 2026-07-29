@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 zstd = ["zstandard>=0.22"]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.6"]
 
 [project.scripts]
 chlab = "chlab.cli:main"
@@ -31,3 +31,18 @@ chlab = ["web/templates/*.html", "web/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",    # long lines are reported by the formatter, not the linter
+    "SIM105",  # contextlib.suppress is not clearer than a two-line try/except here
+    "B008",    # Typer's whole API is function calls in argument defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

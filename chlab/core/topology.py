@@ -4,20 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .spec import ClusterSpec
+from .errors import ChlabError
+from .spec import MAX_NODES, ClusterSpec
 
 #: Host ports for a node are ``port_base + index * NODE_PORT_STRIDE + offset``.
 NODE_PORT_STRIDE = 10
 HTTP_OFFSET = 0
 TCP_OFFSET = 1
-#: Keeper client ports live above the ClickHouse block so node count can grow without collision.
-KEEPER_PORT_BASE_OFFSET = 500
+#: Keeper client ports sit immediately above the largest possible ClickHouse block. Derived
+#: rather than chosen, so the two ranges cannot silently overlap if MAX_NODES ever changes.
+KEEPER_PORT_BASE_OFFSET = MAX_NODES * NODE_PORT_STRIDE
 
 CONTAINER_HTTP_PORT = 8123
 CONTAINER_TCP_PORT = 9000
 CONTAINER_INTERSERVER_PORT = 9009
 CONTAINER_KEEPER_PORT = 9181
 CONTAINER_KEEPER_RAFT_PORT = 9234
+
+
+class UnknownNode(ChlabError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -64,7 +70,10 @@ class Topology:
         for node in self.nodes:
             if node.name == name:
                 return node
-        raise KeyError(f"{name} is not a node of {self.spec.name}")
+        raise UnknownNode(
+            f"{name!r} is not a node of {self.spec.name}; "
+            f"expected one of {', '.join(self.node_names)}"
+        )
 
     @property
     def node_names(self) -> tuple[str, ...]:

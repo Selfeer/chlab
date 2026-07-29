@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from ..core import profiles as profiles_module
+from ..core.errors import ChlabError
 from ..core.query import QueryError, QueryResult
 from ..core.registry import InstanceNotFound
 from ..core.runtime import InstanceStatus, Runtime
@@ -20,6 +21,14 @@ from .jobs import JobRunner
 
 HERE = Path(__file__).parent
 templates = Jinja2Templates(directory=str(HERE / "templates"))
+
+#: Host header values the API will answer on. Binding to loopback is not by itself a defence
+#: against DNS rebinding: any page the user visits can point a hostname it controls at
+#: 127.0.0.1 and then reach this API same-origin. Checking Host closes that.
+ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"})
+#: Rows returned to the browser per query. The editor renders every row into the DOM, and
+#: chlab's own seed data is 100k rows.
+MAX_UI_RESULT_ROWS = 2000
 
 
 class UserPayload(BaseModel):
@@ -51,6 +60,7 @@ class CreatePayload(BaseModel):
 
 class QueryPayload(BaseModel):
     sql: str
+    max_rows: int = MAX_UI_RESULT_ROWS
     node: str | None = None
     all_nodes: bool = False
     user: str = "default"
@@ -58,12 +68,26 @@ class QueryPayload(BaseModel):
     database: str | None = None
 
 
-def create_app(runtime: Runtime | None = None) -> FastAPI:
+def create_app(
+    runtime: Runtime | None = None, *, allowed_hosts: frozenset[str] | None = None
+) -> FastAPI:
     app = FastAPI(title="chlab", docs_url=None, redoc_url=None)
     runtime = runtime or Runtime()
     jobs = JobRunner()
+    permitted = allowed_hosts if allowed_hosts is not None else ALLOWED_HOSTS
 
     app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
+
+    @app.middleware("http")
+    async def check_host(request: Request, call_next):
+        hostname = (request.headers.get("host") or "").rsplit(":", 1)[0] or "localhost"
+        if permitted and hostname not in permitted:
+            return PlainTextResponse(
+                f"chlab does not serve the host {hostname!r}. This API runs SQL and deletes "
+                "clusters, so it answers only on loopback names.",
+                status_code=421,
+            )
+        return await call_next(request)
 
     # --- pages ---------------------------------------------------------------------------
 
@@ -161,7 +185,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if action not in actions:
             raise HTTPException(status_code=400, detail=f"unknown action {action!r}")
         _status_or_404(runtime, name)
-        job = jobs.start(action, name, lambda _record: actions[action](name))
+        job = jobs.start(action, name, lambda record: _run_action(actions[action], name, record))
+        jobs.prune()
         return {"job": job.to_dict()}
 
     @app.post("/api/instances/{name}/query")
@@ -169,6 +194,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         _status_or_404(runtime, name)
         if not payload.sql.strip():
             raise HTTPException(status_code=400, detail="no SQL given")
+        # Cap the result twice over. The settings stop the server early rather than having it
+        # compute rows nobody will render — but `break` only stops at a block boundary, so with
+        # the default block size a 2000-row cap still returns ~65k rows. max_block_size pulls
+        # that boundary down, and the slice below makes the limit exact regardless.
+        limit = max(1, min(payload.max_rows, MAX_UI_RESULT_ROWS))
+        settings = {
+            "max_result_rows": str(limit),
+            "result_overflow_mode": "break",
+            "max_block_size": str(limit),
+        }
+
         try:
             if payload.all_nodes:
                 results = runtime.query_all(
@@ -177,6 +213,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     user=payload.user,
                     password=payload.password,
                     database=payload.database or None,
+                    settings=settings,
                 )
             else:
                 results = [
@@ -187,11 +224,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                         user=payload.user,
                         password=payload.password,
                         database=payload.database or None,
+                        settings=settings,
                     )
                 ]
-        except (QueryError, KeyError) as failure:
+        except (QueryError, ChlabError) as failure:
             raise HTTPException(status_code=400, detail=str(failure)) from failure
-        return {"results": [_result_dict(result) for result in results]}
+        return {
+            "results": [_result_dict(result, limit=limit) for result in results],
+            "row_limit": limit,
+        }
 
     @app.get("/api/profiles")
     def list_profiles():
@@ -202,6 +243,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return JSONResponse(status_code=404, content={"detail": str(failure)})
 
     return app
+
+
+def _run_action(action, name: str, record) -> None:
+    """Run a lifecycle action, threading progress through where the action reports it."""
+    record(f"{action.__name__} {name}")
+    if action.__name__ == "start":
+        action(name, on_event=record)
+    else:
+        action(name)
 
 
 def _status_or_404(runtime: Runtime, name: str) -> InstanceStatus:
@@ -241,14 +291,18 @@ def _status_dict(status: InstanceStatus) -> dict[str, Any]:
     }
 
 
-def _result_dict(result: QueryResult | QueryError) -> dict[str, Any]:
+def _result_dict(result: QueryResult | QueryError, *, limit: int | None = None) -> dict[str, Any]:
     if isinstance(result, QueryError):
         return {"node": result.node, "error": str(result)}
+    rows = result.rows if limit is None else result.rows[:limit]
     return {
         "node": result.node,
         "columns": result.columns,
         "types": result.types,
-        "rows": result.rows,
+        "rows": rows,
+        # ">=" not ">": the server stops *at* the limit, so a full-length result means there
+        # may be more rows we never saw. Claiming completeness there would be a lie.
+        "truncated": limit is not None and len(result.rows) >= limit,
         "rows_read": result.rows_read,
         "elapsed": result.elapsed,
     }

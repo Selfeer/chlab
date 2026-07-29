@@ -79,7 +79,9 @@ def _node_service(
             f"127.0.0.1:{node.tcp_port}:{CONTAINER_TCP_PORT}",
         ],
         "ulimits": {"nofile": {"soft": NOFILE_LIMIT, "hard": NOFILE_LIMIT}},
-        "cap_add": ["SYS_NICE", "IPC_LOCK"],
+        # SYS_NICE only: IPC_LOCK would be needed for mlock, and the generated config sets
+        # mlock_executable to false.
+        "cap_add": ["SYS_NICE"],
         "restart": "unless-stopped",
     }
 

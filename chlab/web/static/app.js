@@ -221,6 +221,7 @@ const chlab = (() => {
     host.textContent = textarea.value;
     textarea.replaceWith(host);
 
+    ace.config.set("basePath", "/static/vendor/ace");
     aceEditor = ace.edit(host, {
       mode: "ace/mode/sql",
       theme: matchMedia("(prefers-color-scheme: dark)").matches
@@ -267,6 +268,8 @@ const chlab = (() => {
     localStorage.setItem(historyKey(instance), JSON.stringify(entries.slice(0, 30)));
     renderHistory(instance);
   }
+
+  let rowLimit = Infinity;
 
   function renderResults(results) {
     const container = document.getElementById("results");
@@ -330,7 +333,7 @@ const chlab = (() => {
 
       runButton.disabled = true;
       try {
-        const { results } = await api(`/api/instances/${instance}/query`, {
+        const { results, row_limit } = await api(`/api/instances/${instance}/query`, {
           method: "POST",
           body: JSON.stringify({
             sql,
@@ -341,6 +344,7 @@ const chlab = (() => {
             database: document.getElementById("database").value || null,
           }),
         });
+        rowLimit = row_limit ?? Infinity;
         renderResults(results);
         recordHistory(instance, sql);
       } catch (failure) {

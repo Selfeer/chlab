@@ -51,7 +51,7 @@ class Cache:
     root: Path
 
     @classmethod
-    def default(cls) -> "Cache":
+    def default(cls) -> Cache:
         return cls(default_cache_dir())
 
     def artifact_dir(self, key: str) -> Path:

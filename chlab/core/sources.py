@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import ChlabError
+
 DOCKER_PREFIX = "docker://"
 URL_ALIAS_PREFIX = "url://"
 FILE_PREFIX = "file://"
@@ -28,13 +30,13 @@ FILE_PREFIX = "file://"
 PACKAGE_SUFFIXES = (".tar.gz", ".deb", ".tgz", ".rpm")
 
 
-class SourceKind(str, enum.Enum):
+class SourceKind(enum.StrEnum):
     DOCKER = "docker"
     URL = "url"
     PATH = "path"
 
 
-class ArtifactType(str, enum.Enum):
+class ArtifactType(enum.StrEnum):
     """What the referenced file actually is, once we have it locally."""
 
     DEB = "deb"
@@ -45,7 +47,7 @@ class ArtifactType(str, enum.Enum):
     IMAGE = "image"
 
 
-class UnsupportedSource(ValueError):
+class UnsupportedSource(ChlabError):
     """Raised for sources chlab cannot handle."""
 
 

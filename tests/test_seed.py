@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import re
 
-import pytest
-
 from chlab.core import seed
 from chlab.core.spec import ClusterSpec, DatabaseSpec, UserSpec
 from chlab.core.topology import build_topology
@@ -31,9 +29,11 @@ def test_user_without_a_password_is_created_with_no_password():
     assert "IDENTIFIED WITH no_password" in statements[0]
 
 
-def test_user_with_a_password_uses_plaintext_auth():
+def test_user_with_a_password_is_stored_hashed():
+    """The server keeps only a hash; the user still logs in with the password they chose."""
     statements = seed.user_statements(UserSpec("dev", "secret"))
-    assert "IDENTIFIED WITH plaintext_password BY 'secret'" in statements[0]
+    assert "IDENTIFIED WITH sha256_password BY 'secret'" in statements[0]
+    assert "plaintext_password" not in statements[0]
 
 
 def test_admin_uses_current_grants_rather_than_all():
@@ -112,9 +112,22 @@ def test_only_the_first_replica_of_each_shard_inserts():
 def test_shards_take_disjoint_slices_of_the_generated_rows():
     inserts = seed.seed_inserts(topology(shards=3, replicas=1, keeper_nodes=0))
     remainders = sorted(
-        int(re.search(r"number % 3 = (\d+)", statement).group(1)) for statement in inserts.values()
+        int(re.search(r"% 3 = (\d+)", statement).group(1)) for statement in inserts.values()
     )
     assert remainders == [0, 1, 2]
+
+
+def test_inserts_place_rows_where_the_sharding_key_says_they_are():
+    """Otherwise optimize_skip_unused_shards=1 silently returns partial results."""
+    spec = topology(shards=2, replicas=1, keeper_nodes=0).spec
+    ddl = "\n".join(seed.seed_ddl(spec))
+    assert f", {seed.SHARDING_KEY})" in ddl
+
+    placement = seed.SHARDING_KEY.replace("user_id", seed.USER_ID_EXPRESSION)
+    for statement in seed.seed_inserts(topology(shards=2, replicas=1, keeper_nodes=0)).values():
+        assert placement in statement
+        # The value inserted into user_id must be the one the placement expression hashes.
+        assert f"{seed.USER_ID_EXPRESSION} AS user_id" in statement
 
 
 def test_insert_row_count_is_configurable():
