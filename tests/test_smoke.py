@@ -177,3 +177,68 @@ def test_a_reproduction_runs_end_to_end(runtime: Runtime, tmp_path: Path):
     assert [step.passed for step in build.steps] == [True] * 5, [s.failures for s in build.steps]
     assert build.steps[1].error_code == 60
     assert not runtime.registry.exists(build.instance)
+
+
+def test_toxiproxy_slows_and_breaks_proxied_reads_only(runtime: Runtime):
+    from chlab.core.query import QueryError
+    from chlab.core.services import toxiproxy
+    from chlab.core.topology import build_topology
+
+    spec = ClusterSpec(name="smoke-proxy", source=IMAGE, services=("s3", "toxiproxy"))
+    try:
+        status = runtime.up(spec)
+        node = build_topology(status.spec).companion("toxiproxy")
+        runtime.query(
+            "smoke-proxy",
+            "INSERT INTO FUNCTION s3(s3, filename='d.csv') SELECT number FROM numbers(10)",
+        )
+        read = "SELECT count() FROM s3({}, filename = 'd.csv')"
+        toxiproxy.set_toxic(node, "latency", 400)
+        slow = runtime.query("smoke-proxy", read.format("s3_proxy"))
+        direct = runtime.query("smoke-proxy", read.format("s3"))
+        assert int(slow.rows[0][0]) == int(direct.rows[0][0]) == 10
+        assert slow.elapsed > 0.4 > direct.elapsed
+
+        # Storage that is gone must fail the read. How fast depends on the build's retry
+        # policy (26.3 returns S3_ERROR at once, 24.8 retries), so only failure is asserted.
+        toxiproxy.set_enabled(node, False)
+        with pytest.raises(QueryError):
+            runtime.query(
+                "smoke-proxy",
+                read.format("s3_proxy"),
+                settings={
+                    "s3_max_single_read_retries": "0",
+                    "s3_retry_attempts": "0",
+                    "max_execution_time": "10",
+                },
+            )
+    finally:
+        runtime.destroy("smoke-proxy")
+
+
+def test_spark_writes_a_table_clickhouse_reads(runtime: Runtime):
+    import subprocess
+
+    from chlab.core.services.s3 import iceberg_without_catalog_sql
+    from chlab.core.services.spark import spark_sql_command
+
+    spec = ClusterSpec(name="smoke-spark", source=IMAGE, services=("s3", "iceberg-rest", "spark"))
+    statements = """
+CREATE NAMESPACE IF NOT EXISTS demo;
+CREATE TABLE demo.t (id BIGINT) USING iceberg LOCATION 's3://warehouse/t'
+  TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='copy-on-write');
+INSERT INTO demo.t SELECT id FROM range(50);
+DELETE FROM demo.t WHERE id < 8;
+"""
+    try:
+        status = runtime.up(spec)
+        result = subprocess.run(
+            spark_sql_command(status.spec), input=statements, text=True, capture_output=True
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        read = iceberg_without_catalog_sql(status.spec)["iceberg_read"].replace(
+            "path/to/table", "t"
+        )
+        assert int(runtime.query("smoke-spark", read.replace("*", "count()")).rows[0][0]) == 42
+    finally:
+        runtime.destroy("smoke-spark")

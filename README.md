@@ -102,6 +102,8 @@ chlab s3          buckets and objects of the s3 service
 chlab py          run a Python script (pyiceberg, pyarrow, boto3) wired to an instance
 chlab tools       run any command (jq, mc, curl) in the same tools container
 chlab repro       run a reproduction directory on one build, or compare two
+chlab spark       Spark SQL against the instance's Iceberg catalogs
+chlab proxy       latency, bandwidth limits and outages between ClickHouse and S3
 chlab profiles    saved topologies
 chlab resolve     resolve a source without launching
 chlab cache       inspect or clear the artifact cache
@@ -121,7 +123,7 @@ chlab cache       inspect or clear the artifact cache
 | `-d`, `--database` | `name[:Atomic\|Replicated]`. Repeatable |
 | `--setting` | Server setting (`config.d`) as `key=value`. Repeatable |
 | `--query-setting` | Query setting for every session (default profile), e.g. `allow_insert_into_iceberg=1`. Repeatable |
-| `-w`, `--with` | Companion service: `s3`, `iceberg-rest`, `ice-rest`. Repeatable |
+| `-w`, `--with` | Companion service: `s3`, `iceberg-rest`, `ice-rest`, `spark`, `toxiproxy`. Repeatable |
 | `--bucket` | Bucket to create in `s3` (default `warehouse`). Repeatable |
 | `--s3-user` | Extra S3 identity, `name:secret[:readwrite\|readonly\|writeonly[:bucket,…]]`. Repeatable |
 | `--seed` | Create the `demo` database with generated rows |
@@ -269,6 +271,49 @@ settings=...)`, `rows(sql)`, and `BUCKET`, `BUCKETS`, `CATALOGS`, `NODES`. The i
 clickhouse-regression's versions: pyiceberg 0.9.0, pyarrow 20.0.0, boto3 1.34.146, plus mc and
 jq. It is built once, on first use.
 
+### Spark: format v3, deletion vectors, MERGE
+
+pyiceberg covers most tables. For the rest — format v3, deletion vectors, merge-on-read
+deletes and updates, `MERGE INTO`, `rewrite_data_files` — add `--with spark`. It needs a catalog,
+and names catalogs as pyiceberg does (`rest`, `ice`), so tables are shared across all three.
+
+```bash
+chlab up -c <source> --name lake --with s3 --with iceberg-rest --with spark
+chlab spark lake "
+  CREATE NAMESPACE IF NOT EXISTS demo;
+  CREATE TABLE demo.t (id BIGINT) USING iceberg
+    TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read');
+  INSERT INTO demo.t SELECT id FROM range(1000);
+  DELETE FROM demo.t WHERE id % 10 = 0;"
+chlab query lake "SELECT count() FROM icebergS3(s3, filename = 'demo/t')"    # 900
+```
+
+It is clickhouse-regression's image (`tabulario/spark-iceberg`, Spark 3.5.5) with the Iceberg
+1.9.1 runtime mounted over its 1.8.1 jars, as the regression suite does: 1.8.1 writes v3 tables
+the 1.9.1 REST catalog rejects. The jars are fetched from Maven Central once and checked
+against pinned SHA-256 sums. Every `chlab spark` call starts a JVM (about 10 s), so batch
+statements; `-f file.sql` and `-f -` read them from a file or stdin.
+
+## Faults between ClickHouse and storage
+
+`--with toxiproxy` puts [Toxiproxy](https://github.com/Shopify/toxiproxy) in front of the s3
+service. Reads through the `s3_proxy` named collections (`s3_proxy_<bucket>` per bucket) go
+through it; `s3` stays direct, so the same files can be read both ways and compared.
+
+```bash
+chlab up -c <source> --name slow --with s3 --with toxiproxy
+chlab proxy latency slow 500 --jitter 50     # per response; --upstream for requests
+chlab query slow "SELECT count() FROM s3(s3_proxy, filename = 'data/*.parquet')" -e 'S3GetObject$'
+chlab proxy bandwidth slow 256               # KB/s
+chlab proxy timeout slow 0                   # hang every connection
+chlab proxy down slow                        # refuse connections: storage is gone
+chlab proxy status slow
+chlab proxy reset slow                       # no faults, proxy up
+```
+
+Latency turns a request count into time: what the 2588 audit measured as "separate GETs
+dominate cold reads" is reproducible as seconds, not just a ProfileEvents number.
+
 ## Reproductions
 
 A reproduction is a directory: `repro.yaml` describes the cluster, and numbered files are the
@@ -305,7 +350,8 @@ builds behaved differently.
 | `.sql` | `clickhouse-client --multiquery` on the first node (or `node`), TSV output |
 | `.sh` | `sh -e` in the tools container, or inside a node with `node` |
 | `.py` | Python in the tools container, with pyiceberg and `chlab_tools` |
-| `.chlab` | one chlab command per line, e.g. `restart`, `s3 put ./x warehouse/`, `cp ./x {instance}:/tmp/` |
+| `.chlab` | one chlab command per line, e.g. `restart`, `s3 put ./x warehouse/`, `proxy latency 500`, `cp ./x {instance}:/tmp/` |
+| `.spark` | Spark SQL, with `spark` in `with:` |
 
 Steps run with the reproduction directory as their working directory, so data files next to
 them (`data.csv`, a crafted Parquet file) are at hand. Expectations:

@@ -63,6 +63,13 @@ repro_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(repro_app, name="repro")
+proxy_app = typer.Typer(
+    help="Inject faults between ClickHouse and object storage (started with --with "
+    "toxiproxy). They apply to reads through the s3_proxy named collections; `s3` stays "
+    "direct.",
+    no_args_is_help=True,
+)
+app.add_typer(proxy_app, name="proxy")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -269,8 +276,9 @@ def up_command(
             "--with",
             "-w",
             help="Start a companion service next to the cluster: s3 (RustFS object storage), "
-            "iceberg-rest (Apache REST catalog), ice-rest (Altinity ice-rest-catalog). The "
-            "catalogs need s3. Repeatable.",
+            "iceberg-rest (Apache REST catalog), ice-rest (Altinity ice-rest-catalog), spark "
+            "(Spark SQL with Iceberg 1.9.1; needs a catalog), toxiproxy (fault injection in "
+            "front of s3). All but s3 need s3. Repeatable.",
         ),
     ] = None,
     bucket: Annotated[
@@ -859,6 +867,178 @@ def tools_shell_command(
     raise typer.Exit(code=subprocess.call(docker_command))
 
 
+# --- spark -------------------------------------------------------------------------------
+
+
+@app.command("spark")
+def spark_command(
+    name: NameArgument,
+    sql: Annotated[str | None, typer.Argument(help="Spark SQL statements, ';'-separated.")] = None,
+    file: Annotated[
+        str | None,
+        typer.Option("--file", "-f", help="Run the statements in this file ('-': stdin)."),
+    ] = None,
+) -> None:
+    """Run Spark SQL against the instance's Iceberg catalogs (started with --with spark).
+
+    Catalogs are named as in pyiceberg — `rest` for iceberg-rest, `ice` for ice-rest — and
+    the first is the default. Each call starts a JVM (20-40s), so batch statements.
+    Exits with spark-sql's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.services.spark import spark_sql_command
+
+    try:
+        spec = Registry().load(name)
+        if not spec.has_service("spark"):
+            raise SpecError(f"{name} has no spark service; launch it with --with spark")
+        if (sql is None) == (file is None):
+            raise SpecError("give exactly one of SQL or --file")
+        if file == "-":
+            statements = sys.stdin.read()
+        elif file is not None:
+            statements = Path(file).read_text()
+        else:
+            statements = sql
+    except OSError as failure:
+        _fail(SpecError(f"could not read {file}: {failure.strerror or failure}"))
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(
+        code=subprocess.run(spark_sql_command(spec), input=statements, text=True).returncode
+    )
+
+
+# --- proxy -------------------------------------------------------------------------------
+
+
+def _proxy(name: str):
+    from .core.topology import build_topology
+
+    spec = Registry().load(name)
+    node = build_topology(spec).companion("toxiproxy")
+    if node is None:
+        raise SpecError(f"{name} has no toxiproxy service; launch it with --with toxiproxy")
+    return node
+
+
+def _proxy_action(name: str, action, message: str) -> None:
+    try:
+        action(_proxy(name))
+    except ChlabError as failure:
+        _fail(failure)
+    console.print(message)
+
+
+UpstreamOption = Annotated[
+    bool,
+    typer.Option("--upstream", help="Apply to requests (ClickHouse to S3) instead of responses."),
+]
+
+
+@proxy_app.command("status")
+def proxy_status(name: NameArgument, json: JsonOption = False) -> None:
+    """Show whether the proxy is up and which faults are active."""
+    from .core.services import toxiproxy
+
+    try:
+        info = toxiproxy.status(_proxy(name))
+    except ChlabError as failure:
+        _fail(failure)
+    if json:
+        console.print_json(jsonlib.dumps(info))
+        return
+    console.print(f"{'enabled' if info['enabled'] else '[red]disabled[/red]'}: {info['upstream']}")
+    for toxic in info["toxics"]:
+        details = ", ".join(
+            f"{k}={v}" for k, v in toxic.items() if k not in {"name", "type", "stream"}
+        )
+        console.print(f"  {toxic['type']} ({toxic['stream']}): {details}")
+    if not info["toxics"]:
+        console.print("[dim]  no faults[/dim]")
+
+
+@proxy_app.command("latency")
+def proxy_latency(
+    name: NameArgument,
+    milliseconds: Annotated[int, typer.Argument(help="Delay added to every response.")],
+    jitter: Annotated[int, typer.Option("--jitter", help="Random +/- milliseconds.")] = 0,
+    upstream: UpstreamOption = False,
+) -> None:
+    """Add latency, e.g. to see what one GET per bloom filter costs on real storage."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(
+            node, "latency", milliseconds, jitter=jitter, upstream=upstream
+        ),
+        f"latency {milliseconds}ms" + (f" +/- {jitter}ms" if jitter else ""),
+    )
+
+
+@proxy_app.command("bandwidth")
+def proxy_bandwidth(
+    name: NameArgument,
+    kilobytes_per_second: Annotated[int, typer.Argument(help="Throughput limit, KB/s.")],
+    upstream: UpstreamOption = False,
+) -> None:
+    """Limit throughput."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(
+            node, "bandwidth", kilobytes_per_second, upstream=upstream
+        ),
+        f"bandwidth {kilobytes_per_second} KB/s",
+    )
+
+
+@proxy_app.command("timeout")
+def proxy_timeout(
+    name: NameArgument,
+    milliseconds: Annotated[
+        int, typer.Argument(help="Close connections after this long; 0 holds them forever.")
+    ],
+    upstream: UpstreamOption = False,
+) -> None:
+    """Stop all data, as a storage server that hangs mid-request."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(node, "timeout", milliseconds, upstream=upstream),
+        f"timeout after {milliseconds}ms",
+    )
+
+
+@proxy_app.command("down")
+def proxy_down(name: NameArgument) -> None:
+    """Refuse every connection, as storage that is gone."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, lambda node: toxiproxy.set_enabled(node, False), "proxy down")
+
+
+@proxy_app.command("up")
+def proxy_up(name: NameArgument) -> None:
+    """Accept connections again, keeping any faults."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, lambda node: toxiproxy.set_enabled(node, True), "proxy up")
+
+
+@proxy_app.command("reset")
+def proxy_reset(name: NameArgument) -> None:
+    """Remove every fault and bring the proxy up."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, toxiproxy.reset, "proxy reset: no faults")
+
+
 # --- repro -------------------------------------------------------------------------------
 
 
@@ -1328,8 +1508,11 @@ def _print_instance(status: InstanceStatus) -> None:
         )
     for keeper in status.topology.keepers:
         table.add_row(keeper.name, "-", "-", f"127.0.0.1:{keeper.client_port}", "-", "-")
-    for service in status.topology.services:
-        table.add_row(service.name, "-", "-", f"http://127.0.0.1:{service.port_base}", "-", "-")
+    from .core import services as companions
+
+    for service, endpoint in companions.active(status.topology):
+        host = service.describe(status.topology, endpoint).get("host", {}).get("endpoint", "-")
+        table.add_row(service.name, "-", "-", host, "-", "-")
     console.print(table)
 
 

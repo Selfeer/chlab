@@ -9,6 +9,7 @@
                                `# chlab: node`
       04-restart.chlab         chlab commands: `restart`, `s3 put ...`, `cp ...`
       05-verify.py             run in the tools container, with pyiceberg and chlab_tools
+      06-v3.spark              Spark SQL, for format v3 and deletion vectors (`with: [spark]`)
 
 Steps run in file-name order on a fresh instance. Expectations state the *correct*
 behaviour, as a regression test would; a reproduced bug shows up as a failed step. That way a
@@ -62,7 +63,7 @@ from .spec import (
 )
 
 REPRO_FILE = "repro.yaml"
-STEP_KINDS = {".sql": "sql", ".sh": "sh", ".py": "py", ".chlab": "chlab"}
+STEP_KINDS = {".sql": "sql", ".sh": "sh", ".py": "py", ".chlab": "chlab", ".spark": "spark"}
 DEFAULT_TIMEOUT = 600
 #: Output kept per step in the JSON result and the report. Enough to read; not a log dump.
 MAX_OUTPUT = 20_000
@@ -91,7 +92,20 @@ SPEC_KEYS = {
 
 #: chlab commands a .chlab step may run. Lifecycle commands that would end the instance
 #: (`rm`, `down`) are deliberately absent: the runner owns the instance's life.
-CHLAB_ACTIONS = {"restart", "stop", "start", "exec", "cp", "s3", "query", "py", "tools", "logs"}
+CHLAB_ACTIONS = {
+    "restart",
+    "stop",
+    "start",
+    "exec",
+    "cp",
+    "s3",
+    "query",
+    "py",
+    "tools",
+    "logs",
+    "proxy",
+    "spark",
+}
 
 
 class ReproError(ChlabError):
@@ -145,6 +159,8 @@ class Step:
             return self.node or "tools container"
         if self.kind == "py":
             return "tools container"
+        if self.kind == "spark":
+            return "spark"
         return "chlab"
 
 
@@ -185,7 +201,7 @@ def load(directory: Path) -> Repro:
         if path.is_file() and path.suffix in STEP_KINDS
     )
     if not steps:
-        raise ReproError(f"{directory} has no steps (.sql, .sh, .py or .chlab files)")
+        raise ReproError(f"{directory} has no steps (.sql, .sh, .py, .chlab or .spark files)")
 
     fields = spec_fields(config)
     # Validate now, with placeholder identity, so a typo fails before anything launches.
@@ -312,7 +328,7 @@ def parse_step(path: Path) -> Step:
                 "expected expect, node, user, setting or timeout"
             )
 
-    if kind in {"py", "chlab"} and options.get("node"):
+    if kind in {"py", "chlab", "spark"} and options.get("node"):
         raise ReproError(f"{path.name}: `node` applies to .sql and .sh steps only")
     if kind != "sql" and (options["settings"] or "user" in options):
         raise ReproError(f"{path.name}: `user` and `setting` apply to .sql steps only")
@@ -509,6 +525,12 @@ class Runner:
                 spec.name, ["sh", "-e", "-s"], service=step.node, interactive=True
             )
             return command, script, directory
+        if step.kind == "spark":
+            from .services.spark import spark_sql_command
+
+            if not spec.has_service("spark"):
+                raise ReproError(f"{step.name} is a Spark step; add spark to `with:`")
+            return spark_sql_command(spec), script, directory
         if step.kind in {"sh", "py"}:
             interpreter = ["sh", "-e", "-s"] if step.kind == "sh" else ["python", "-"]
             command = tools_command(
@@ -538,7 +560,7 @@ def _chlab_script(instance: str, script: str) -> list[str]:
             )
         if "{instance}" in line:
             words = [word.replace("{instance}", instance) for word in words]
-        elif words[0] == "s3" and len(words) > 1:
+        elif words[0] in {"s3", "proxy"} and len(words) > 1:
             words = [words[0], words[1], instance, *words[2:]]
         else:
             words = [words[0], instance, *words[1:]]

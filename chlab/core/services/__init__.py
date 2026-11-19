@@ -9,9 +9,12 @@ from ..topology import ServiceNode, Topology
 from .base import Service
 from .catalogs import IcebergRestFixture, IceRestCatalog
 from .s3 import S3
+from .spark import Spark
+from .toxiproxy import Toxiproxy
 
 REGISTRY: dict[str, Service] = {
-    service.name: service for service in (S3(), IcebergRestFixture(), IceRestCatalog())
+    service.name: service
+    for service in (S3(), IcebergRestFixture(), IceRestCatalog(), Spark(), Toxiproxy())
 }
 
 if set(REGISTRY) != set(KNOWN_SERVICES):

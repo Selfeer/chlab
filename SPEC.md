@@ -267,8 +267,9 @@ field, topology/compose/runtime treat them like keepers. No service is started u
 | `spark` | `tabulario/spark-iceberg` | Opt-in and heavy (20–40s JVM start per call). Only for what pyiceberg cannot write: format v3, deletion vectors, merge-on-read deletes. |
 | later | toxiproxy, Azurite, Kafka | Latency/fault injection in front of S3 first. |
 
-Implemented as `iceberg-rest` → `apache/iceberg-rest-fixture:1.9.1` and `ice-rest` →
-`altinity/ice-rest-catalog:0.16.0`; `spark` is still to come.
+Implemented as `iceberg-rest` → `apache/iceberg-rest-fixture:1.9.1`, `ice-rest` →
+`altinity/ice-rest-catalog:0.16.0`, `spark` → `tabulario/spark-iceberg` with Iceberg 1.9.1, and
+`toxiproxy` → `ghcr.io/shopify/toxiproxy:2.12.0`.
 
 Glue is TBD: the only local option, LocalStack Pro, needs a paid token. Nessie, Polaris,
 Hive and Unity have no prior art in clickhouse-regression and are not planned.
@@ -400,6 +401,25 @@ once would race the port allocation the registry is meant to serialise.
 error code, output (clipped at 20,000 characters), failures and diff; `report.md` is
 generated from it.
 
+### Decisions made for Spark and faults
+
+**Spark is the regression suite's, pinned.** `tabulario/spark-iceberg` has only a moving
+`latest` tag, so chlab pins its digest. Its bundled Iceberg 1.8.1 writes v3 tables the 1.9.1
+REST catalog rejects; like the regression suite, chlab mounts the 1.9.1 runtime and AWS bundle
+over the 1.8.1 jar paths. They come from Maven Central into the cache, verified against
+SHA-256 sums that match both Maven's published SHA-1 and the regression repository's copies,
+and are hard-linked into each instance. The image's entrypoint (a standalone cluster, a
+history server, a notebook) is replaced by an idle process; `spark-sql` runs in local mode
+per call, about 10 s each.
+
+**Faults sit on a second path, not the only one.** Toxiproxy fronts the s3 service and
+ClickHouse reaches it through `s3_proxy` collections, leaving `s3` direct. A reproduction can
+show the same read fast and slow, or working and failing, in one run. Faults are named per
+kind and direction, so setting latency twice replaces it rather than stacking it.
+
+**Observed while testing:** with the proxy down, 26.3 fails a read with `S3_ERROR` at once;
+24.8 did not stop within `max_execution_time = 10` and ran until chlab's 60 s HTTP timeout.
+
 ### Phases
 
 1. **Interaction primitives** — done. `exec`, `cp`, `restart`, `query --file` and
@@ -410,8 +430,10 @@ generated from it.
    `chlab tools`, version-gated SQL for catalog and catalog-less use.
 4. **Reproduction files** — done. `chlab repro init|check|run`, `--compare`, JSON result and
    markdown report; `examples/repro/2792-metadata-log`.
-5. **On demand:** `spark`, toxiproxy, Azurite, cluster-function setups for `s3Cluster` /
-   `icebergS3Cluster`.
+5. **Spark and faults** — done. `spark` (Iceberg 1.9.1 overlay), `toxiproxy` with
+   `chlab proxy`, `.spark` steps and `proxy` in `.chlab` steps.
+6. **On demand:** Azurite, Kafka, cluster discovery (swarm) setups. `s3Cluster` and
+   `icebergS3Cluster` already work against `default_cluster`.
 
 ## Possible next steps
 

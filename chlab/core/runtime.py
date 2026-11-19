@@ -130,6 +130,9 @@ class Runtime:
             notify("building the chlab base image")
             image = ensure_base_image()
 
+        for service, _endpoint in companions.active(topology):
+            service.prepare(topology, directory, self.cache, notify)
+
         notify("writing configuration")
         configgen.write_configs(topology, directory, base_image_mode=not resolved.runs_as_image)
         compose.write(topology, resolved, directory, image)

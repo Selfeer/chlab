@@ -21,9 +21,16 @@ MAX_NODES = 30
 #: Bounds the keeper port range, so companion service ports can sit above it.
 MAX_KEEPERS = 9
 #: Companion services ``--with`` accepts. Each has a module in ``chlab.core.services``.
-KNOWN_SERVICES = ("s3", "iceberg-rest", "ice-rest")
+KNOWN_SERVICES = ("s3", "iceberg-rest", "ice-rest", "spark", "toxiproxy")
 #: Services that cannot run without others. Catalogs keep their tables in object storage.
-SERVICE_REQUIREMENTS = {"iceberg-rest": ("s3",), "ice-rest": ("s3",)}
+SERVICE_REQUIREMENTS = {
+    "iceberg-rest": ("s3",),
+    "ice-rest": ("s3",),
+    "spark": ("s3",),
+    "toxiproxy": ("s3",),
+}
+#: Services that need at least one of these. Spark writes tables through a catalog.
+SERVICE_NEEDS_ONE_OF = {"spark": ("iceberg-rest", "ice-rest")}
 DEFAULT_BUCKET = "warehouse"
 #: S3 bucket naming rules, minus the ones (no IP-address names) no one hits in a lab.
 BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -196,6 +203,11 @@ class ClusterSpec:
             for required in SERVICE_REQUIREMENTS.get(service, ()):
                 if required not in self.services:
                     raise SpecError(f"{service} needs {required}; add --with {required}")
+            options = SERVICE_NEEDS_ONE_OF.get(service)
+            if options and not any(option in self.services for option in options):
+                raise SpecError(
+                    f"{service} needs a catalog; add --with {' or --with '.join(options)}"
+                )
 
         if (self.buckets or self.s3_users) and not self.has_service("s3"):
             raise SpecError("--bucket and --s3-user need the s3 service; add --with s3")

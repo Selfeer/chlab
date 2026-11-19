@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..cache import Cache
 from ..events import EventCallback
 from ..topology import ServiceNode, Topology
 
@@ -22,6 +23,9 @@ class Service:
     def compose_service(self, topology: Topology, node: ServiceNode, root: Path) -> dict[str, Any]:
         """The compose definition. ``root`` is the instance directory, where ``files`` live."""
         raise NotImplementedError
+
+    def prepare(self, topology: Topology, root: Path, cache: Cache, notify: EventCallback) -> None:
+        """Before launch: fetch what the service needs into ``root/services/<name>/``."""
 
     def files(self, topology: Topology) -> dict[str, str]:
         """Files to write under ``<instance>/services/<name>/``, keyed by relative path."""
