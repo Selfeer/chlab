@@ -151,3 +151,29 @@ table.append(pa.table({"id": pa.array(range(42), pa.int64())}))
         assert int(runtime.query("smoke-ice", read.replace("*", "count()")).rows[0][0]) == 42
     finally:
         runtime.destroy("smoke-ice")
+
+
+def test_a_reproduction_runs_end_to_end(runtime: Runtime, tmp_path: Path):
+    """SQL with a reference, an expected error, a node script and a restart, on fresh instances."""
+    from chlab.core import repro
+
+    directory = tmp_path / "r"
+    directory.mkdir()
+    (directory / "repro.yaml").write_text("title: smoke\n")
+    (directory / "01-create.sql").write_text(
+        "CREATE TABLE t (a Int32) ENGINE = MergeTree ORDER BY a; INSERT INTO t VALUES (1), (2);"
+    )
+    (directory / "02-missing.sql").write_text("-- chlab: expect error 60\nSELECT * FROM nope;")
+    (directory / "03-files.sh").write_text(
+        "# chlab: node clickhouse1\n# chlab: expect contains clickhouse-server\nls /etc\n"
+    )
+    (directory / "04-restart.chlab").write_text("restart\n")
+    (directory / "05-count.sql").write_text("SELECT count() FROM t;")
+    (directory / "05-count.reference").write_text("2\n")
+
+    run = repro.Runner(runtime).run(repro.load(directory), [IMAGE])
+    build = run.builds[0]
+    assert build.error is None, build.error
+    assert [step.passed for step in build.steps] == [True] * 5, [s.failures for s in build.steps]
+    assert build.steps[1].error_code == 60
+    assert not runtime.registry.exists(build.instance)

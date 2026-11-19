@@ -101,6 +101,7 @@ chlab ui          web interface
 chlab s3          buckets and objects of the s3 service
 chlab py          run a Python script (pyiceberg, pyarrow, boto3) wired to an instance
 chlab tools       run any command (jq, mc, curl) in the same tools container
+chlab repro       run a reproduction directory on one build, or compare two
 chlab profiles    saved topologies
 chlab resolve     resolve a source without launching
 chlab cache       inspect or clear the artifact cache
@@ -267,6 +268,64 @@ chlab tools lake -- sh -c 'mc cat s3/warehouse/events/metadata/<file>.metadata.j
 settings=...)`, `rows(sql)`, and `BUCKET`, `BUCKETS`, `CATALOGS`, `NODES`. The image pins
 clickhouse-regression's versions: pyiceberg 0.9.0, pyarrow 20.0.0, boto3 1.34.146, plus mc and
 jq. It is built once, on first use.
+
+## Reproductions
+
+A reproduction is a directory: `repro.yaml` describes the cluster, and numbered files are the
+steps. `chlab repro run` launches a fresh instance, runs the steps in name order, removes the
+instance, and writes `result.json` and a `report.md` short enough to paste under a PR.
+
+```
+examples/repro/2792-metadata-log/
+  repro.yaml                    title, build, and the cluster — same values as `chlab up`
+  01-create.sql                 clickhouse-client --multiquery on a node
+  02-optimize.sql
+  03-metadata-log.sh            sh -e; here on clickhouse1, via `# chlab: node clickhouse1`
+  03-metadata-log.reference     expected output
+  04-restart.chlab              chlab commands, without the instance name
+  05-count.sql
+  05-count.reference
+```
+
+```bash
+chlab repro init repro/my-finding --with s3     # skeleton
+chlab repro check repro/my-finding              # validate without running
+chlab repro run repro/my-finding -c <build>
+chlab repro run repro/my-finding -c <pr build> --compare <base build>
+```
+
+**Write expectations for the correct behaviour**, as a regression test would. A reproduced
+bug then shows up as a failed step, and the directory becomes the regression test for the fix
+unchanged. `repro run` exits 0 when every expectation held, 1 when any did not, and 2 when a
+cluster could not start. With `--compare`, the report also lists every step where the two
+builds behaved differently.
+
+| Step | Runs |
+|---|---|
+| `.sql` | `clickhouse-client --multiquery` on the first node (or `node`), TSV output |
+| `.sh` | `sh -e` in the tools container, or inside a node with `node` |
+| `.py` | Python in the tools container, with pyiceberg and `chlab_tools` |
+| `.chlab` | one chlab command per line, e.g. `restart`, `s3 put ./x warehouse/`, `cp ./x {instance}:/tmp/` |
+
+Steps run with the reproduction directory as their working directory, so data files next to
+them (`data.csv`, a crafted Parquet file) are at hand. Expectations:
+
+| | |
+|---|---|
+| `NN-step.reference` | output must equal this file (trailing whitespace ignored) |
+| `-- chlab: expect error 497` | the step must fail, with this ClickHouse error code (code optional) |
+| `-- chlab: expect contains TEXT` | output must contain TEXT; repeatable |
+| `-- chlab: expect empty` | no output |
+| `-- chlab: expect ok` | the default: the step succeeds |
+
+Other directives: `node clickhouse2`, `user dev:pw` and `setting key=value` (for `.sql`),
+`timeout 300`. In `.sh`, `.py` and `.chlab` files they start with `#` instead of `--`.
+
+`repro.yaml` takes `title`, `clickhouse` and `compare` (default builds; `-c` replaces the
+first, `--no-compare` drops the second), and the cluster: `shards`, `replicas`, `keeper`,
+`cluster_name`, `users`, `grants`, `databases`, `settings`, `query_settings`, `with`,
+`buckets`, `s3_users`, `seed`. An unknown key is an error, so a typo cannot silently launch the
+wrong cluster.
 
 ## Examples
 

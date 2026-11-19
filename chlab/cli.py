@@ -57,6 +57,12 @@ profiles_app = typer.Typer(help="Saved cluster topologies.", no_args_is_help=Tru
 app.add_typer(cache_app, name="cache")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(s3_app, name="s3")
+repro_app = typer.Typer(
+    help="Reproductions as directories: repro.yaml describes the cluster, numbered "
+    ".sql/.sh/.py/.chlab files are the steps. See `chlab repro init`.",
+    no_args_is_help=True,
+)
+app.add_typer(repro_app, name="repro")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -851,6 +857,154 @@ def tools_shell_command(
     except ChlabError as failure:
         _fail(failure)
     raise typer.Exit(code=subprocess.call(docker_command))
+
+
+# --- repro -------------------------------------------------------------------------------
+
+
+@repro_app.command("init")
+def repro_init(
+    directory: Annotated[Path, typer.Argument(help="Directory to create.")],
+    title: Annotated[str | None, typer.Option("--title", help="One-line description.")] = None,
+    with_service: Annotated[
+        list[str] | None, typer.Option("--with", "-w", help="Service to include. Repeatable.")
+    ] = None,
+) -> None:
+    """Create a reproduction skeleton: repro.yaml and a first step."""
+    from .core import repro
+
+    try:
+        repro.init(directory, title=title, services=with_service)
+    except ChlabError as failure:
+        _fail(failure)
+    console.print(f"created {directory / repro.REPRO_FILE} and {directory / '01-setup.sql'}")
+
+
+@repro_app.command("check")
+def repro_check(
+    directory: Annotated[Path, typer.Argument(help="Reproduction directory.")],
+    json: JsonOption = False,
+) -> None:
+    """Validate a reproduction without running it: repro.yaml, steps, directives."""
+    from .core import repro
+
+    try:
+        loaded = repro.load(directory)
+    except ChlabError as failure:
+        _fail(failure)
+
+    steps = [
+        {
+            "step": step.name,
+            "kind": step.kind,
+            "where": step.where,
+            "expect": step.expect.describe(),
+        }
+        for step in loaded.steps
+    ]
+    if json:
+        console.print_json(jsonlib.dumps({"title": loaded.title, "steps": steps}))
+        return
+    console.print(f"[bold]{escape(loaded.title)}[/bold]")
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    for column in ("STEP", "RUNS ON", "EXPECTS"):
+        table.add_column(column)
+    for step in steps:
+        table.add_row(step["step"], step["where"], step["expect"])
+    console.print(table)
+
+
+@repro_app.command("run")
+def repro_run(
+    directory: Annotated[Path, typer.Argument(help="Reproduction directory.")],
+    clickhouse: Annotated[
+        str | None,
+        typer.Option("--clickhouse", "-c", help="Build to run on. Defaults to repro.yaml's."),
+    ] = None,
+    compare: Annotated[
+        str | None,
+        typer.Option(
+            "--compare",
+            help="Also run on this build and report the steps where the two behave differently.",
+        ),
+    ] = None,
+    no_compare: Annotated[
+        bool, typer.Option("--no-compare", help="Ignore compare: in repro.yaml.")
+    ] = False,
+    keep: Annotated[
+        bool, typer.Option("--keep", help="Leave the instances running for inspection.")
+    ] = False,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Where to write result.json and report.md. "
+            "Default: <directory>/results/<timestamp>.",
+        ),
+    ] = None,
+    json: Annotated[bool, typer.Option("--json", help="Print result.json to stdout.")] = False,
+) -> None:
+    """Run a reproduction on fresh instances, then remove them.
+
+    Exits 0 when every step met its expectation on every build, 1 when any step did not —
+    expectations describe correct behaviour, so 1 usually means the bug reproduced — and 2
+    when a cluster could not be launched.
+    """
+    from .core import repro
+
+    try:
+        loaded = repro.load(directory)
+        primary = clickhouse or loaded.clickhouse
+        if not primary:
+            raise SpecError("give the build with -c, or set clickhouse: in repro.yaml")
+        sources = [primary]
+        second = compare or (None if no_compare else loaded.compare)
+        if second:
+            sources.append(second)
+    except ChlabError as failure:
+        _fail(failure)
+
+    events = error_console if json else console
+    with _spinner("starting") as report:
+
+        def notify(message: str) -> None:
+            report.event(message)
+            if message.endswith(("passed", "FAILED")):
+                colour = "green" if message.endswith("passed") else "red"
+                events.print(f"[{colour}]{escape(message)}[/{colour}]")
+
+        run = repro.Runner(on_event=notify).run(loaded, sources, keep=keep)
+
+    stamp = run.started.replace(":", "").replace("-", "")
+    destination = out or (loaded.directory / "results" / stamp)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "result.json").write_text(jsonlib.dumps(run.to_dict(), indent=2) + "\n")
+    (destination / "report.md").write_text(repro.markdown(run))
+
+    if json:
+        console.print_json(jsonlib.dumps(run.to_dict()))
+    else:
+        console.print()
+        for build in run.builds:
+            if build.error:
+                verdict = "[red]launch failed[/red]"
+            else:
+                verdict = "[green]passed[/green]" if build.passed else "[red]failed[/red]"
+            kept = f" (kept as {build.instance})" if build.kept else ""
+            console.print(f"{escape(build.source)} ({build.version or '?'}): {verdict}{kept}")
+            if build.error:
+                error_console.print(escape(build.error.strip()))
+        if len(run.builds) == 2 and run.launched:
+            console.print(
+                "builds differ at: " + ", ".join(run.differences)
+                if run.differences
+                else "both builds behaved identically"
+            )
+        console.print(f"[dim]{destination / 'report.md'}[/dim]")
+
+    if not run.launched:
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=0 if run.passed else 1)
 
 
 # --- s3 ----------------------------------------------------------------------------------

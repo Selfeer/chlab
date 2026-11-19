@@ -1,0 +1,2 @@
+# The table must survive the server reopening it.
+restart

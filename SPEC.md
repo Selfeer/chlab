@@ -371,6 +371,35 @@ chlab that runs it.
 `icebergS3` from 24.9 (`iceberg` before). A version that does not parse — `head` — counts as
 new, not old.
 
+### Decisions made for reproductions
+
+**Expectations describe correct behaviour.** The alternative — asserting the bug — makes
+every reproduction obsolete the moment the fix lands, and makes "passed" mean "broken".
+Expected output lives in `NN-step.reference`, the convention of ClickHouse's own stateless
+tests, so ClickHouse developers read it without explanation.
+
+**Directives live in the step, not in repro.yaml.** The expectation sits next to the SQL it
+is about. `repro.yaml` describes only the cluster, with exactly the vocabulary of `chlab up`,
+and rejects unknown keys.
+
+**Every step runs in a container or through chlab.** `.sh` runs in the tools container or a
+node, never on the host: reproductions are written by reviewers and agents and handed to
+developers, and running one should not mean trusting it with the host. `.chlab` steps reach
+the host only through an allowlist of chlab commands, which excludes `rm`, `down` and `up` —
+the runner owns the instance's life. `.sh` runs with `-e`, so a step stops where it fails
+rather than printing something from a state it never reached.
+
+**SQL error codes come from the server's message.** clickhouse-client exits with the error
+code modulo 256, so `Code: N` is read from its error output instead.
+
+**Fresh instances, removed afterwards.** Each build gets `repro-<dir>-<n>` and its own port
+block. `--keep` leaves them for inspection. Builds run one after another; launching both at
+once would race the port allocation the registry is meant to serialise.
+
+**A run result is plain data.** `result.json` carries every step's exit code, ClickHouse
+error code, output (clipped at 20,000 characters), failures and diff; `report.md` is
+generated from it.
+
 ### Phases
 
 1. **Interaction primitives** — done. `exec`, `cp`, `restart`, `query --file` and
@@ -379,7 +408,8 @@ new, not old.
    identities, the `chlab s3` commands, named collections, `query --events`.
 3. **Iceberg** — done. `iceberg-rest`, `ice-rest`, the tools image, `chlab py` and
    `chlab tools`, version-gated SQL for catalog and catalog-less use.
-4. **Reproduction files:** `chlab repro run`, with `--compare`.
+4. **Reproduction files** — done. `chlab repro init|check|run`, `--compare`, JSON result and
+   markdown report; `examples/repro/2792-metadata-log`.
 5. **On demand:** `spark`, toxiproxy, Azurite, cluster-function setups for `s3Cluster` /
    `icebergS3Cluster`.
 

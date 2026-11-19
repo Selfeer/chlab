@@ -1,0 +1,6 @@
+# Altinity/ClickHouse#2792: Iceberg metadata-log must record the metadata file each write
+# replaces, never the file being written.
+title: Iceberg metadata-log records the previous metadata file
+clickhouse: docker://altinity/clickhouse-server:26.3.60.20002.altinityantalya
+# The PR build to check against, e.g. the CI artifact of the PR head:
+# compare: https://altinity-build-artifacts.s3.amazonaws.com/PRs/2792/<sha>/.../clickhouse-common-static_..._amd64.deb
