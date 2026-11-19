@@ -39,7 +39,9 @@ def runtime(tmp_path: Path, monkeypatch) -> Runtime:
 @pytest.fixture
 def client(runtime: Runtime) -> TestClient:
     # A real loopback host, so the Host allowlist middleware is exercised rather than bypassed.
-    return TestClient(create_app(runtime), base_url="http://127.0.0.1:7777")
+    return TestClient(
+        create_app(runtime), base_url="http://127.0.0.1:7777", headers={"X-Chlab-Request": "1"}
+    )
 
 
 def test_foreign_host_headers_are_refused(runtime: Runtime):

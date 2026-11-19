@@ -98,19 +98,24 @@ re-resolved only on `--force`.
 
 ### Version detection
 
-Authoritative version comes from asking the binary: `clickhouse server --version`. Tried on the
-host first (fast, no Docker needed); on failure — wrong architecture, missing loader — it is
-retried inside a container. For `docker://` sources it runs inside that image. Parsing the
-version out of a Docker tag is a last-resort fallback only, and warns.
+Authoritative version comes from asking the binary: `clickhouse server --version`. For
+`docker://` sources it runs inside that image. Parsing the version out of a Docker tag is a
+last-resort fallback only, and warns.
 
 Determining a version means *executing* the artifact, so where that happens matters. A binary
-just fetched from a URL is probed **in a container first** — running it on the host would make
-`chlab up -c http://…` remote code execution on the host. A binary the user already had on disk
-is probed on the host first instead: they chose that file, and requiring Docker to read a local
-build's version would break working offline. Either way the answer is cached.
+fetched from a URL, or named by a reproduction's `repro.yaml`, is probed **only in a
+container**, with no network. There is no host fallback: a hostile binary could fail the
+container probe on purpose to get run outside Docker, so when the container cannot read the
+version, `--clickhouse-version` must give it. A binary the user named on the command line is
+probed on the host first, then in a container (wrong architecture, missing loader): they chose
+that file, and requiring Docker to read a local build's version would break working offline.
+Either way the answer is cached.
 
 `--clickhouse-version` overrides detection entirely, as in `regression.py`. `--sha256` verifies
-a download before it is unpacked; plain `http://` sources warn.
+the artifact — a download before it is unpacked, a cached one, or a local file; a cache entry
+not verified against that digest is fetched or extracted again rather than trusted. Plain
+`http://` sources warn, and a redirect from `https://` to `http://` is refused. A download
+that sends nothing for 120 seconds is abandoned.
 
 Downloads are checked against `Content-Length`. `http.client` does not raise when a body ends
 short, so without that check a connection dropped mid-transfer would be renamed into place and
@@ -383,12 +388,23 @@ tests, so ClickHouse developers read it without explanation.
 is about. `repro.yaml` describes only the cluster, with exactly the vocabulary of `chlab up`,
 and rejects unknown keys.
 
-**Every step runs in a container or through chlab.** `.sh` runs in the tools container or a
-node, never on the host: reproductions are written by reviewers and agents and handed to
-developers, and running one should not mean trusting it with the host. `.chlab` steps reach
-the host only through an allowlist of chlab commands, which excludes `rm`, `down` and `up` —
-the runner owns the instance's life. `.sh` runs with `-e`, so a step stops where it fails
-rather than printing something from a state it never reached.
+**Every step runs in a container or through confined chlab.** Reproductions are written by
+reviewers and agents, often from a PR's own text, and handed to developers; running one
+should not mean trusting it with the host. `.sql`, `.sh`, `.py` and `.spark` run in the
+instance's containers, which see only the reproduction directory. `.chlab` steps run the chlab
+CLI on the host, so they are confined three ways: an allowlist of commands, which excludes
+`rm`, `down` and `up` (the runner owns the instance's life); the run's own instance only —
+any other name behaves as if it did not exist; and host files only inside the reproduction
+directory, checked after resolving symlinks, for `cp`, `s3 put`/`get`, `query -f`,
+`spark -f` and `py`. The confinement travels to the child CLI as `CHLAB_CONFINE_INSTANCE` and
+`CHLAB_CONFINE_DIR`. A build named by `repro.yaml` is never executed on the host (see
+version detection); one given with `-c` is the user's choice. Results are written without
+following symlinks a step may have planted. `.sh` runs with `-e`, so a step stops where it
+fails rather than printing something from a state it never reached.
+
+What is *not* contained: the containers have network access, as ClickHouse needs for
+`url()` and friends. A reproduction can talk to the internet and to services the host exposes
+on non-loopback addresses.
 
 **SQL error codes come from the server's message.** clickhouse-client exits with the error
 code modulo 256, so `Code: N` is read from its error output instead.

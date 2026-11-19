@@ -5,7 +5,9 @@ const chlab = (() => {
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
+      // X-Chlab-Request: the API refuses state changes without it, which is what stops
+      // another site from posting a form at it.
+      headers: { "Content-Type": "application/json", "X-Chlab-Request": "1" },
       ...options,
     });
     const body = await response.json().catch(() => ({}));

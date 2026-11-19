@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -25,7 +26,19 @@ templates = Jinja2Templates(directory=str(HERE / "templates"))
 #: Host header values the API will answer on. Binding to loopback is not by itself a defence
 #: against DNS rebinding: any page the user visits can point a hostname it controls at
 #: 127.0.0.1 and then reach this API same-origin. Checking Host closes that.
-ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"})
+ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+#: Header every state-changing request must carry. A cross-origin page can submit a plain
+#: HTML form to this API without reading the answer — enough to `destroy` an instance — but
+#: it cannot add a custom header without a CORS preflight, which this API never grants.
+CSRF_HEADER = "X-Chlab-Request"
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: Defence in depth for a page with the power to run SQL and delete clusters.
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+}
 #: Rows returned to the browser per query. The editor renders every row into the DOM, and
 #: chlab's own seed data is 100k rows.
 MAX_UI_RESULT_ROWS = 2000
@@ -90,7 +103,14 @@ def create_app(
                 "clusters, so it answers only on loopback names.",
                 status_code=421,
             )
-        return await call_next(request)
+        if request.method not in SAFE_METHODS:
+            refusal = _cross_site_refusal(request, permitted)
+            if refusal:
+                return PlainTextResponse(refusal, status_code=403)
+        response = await call_next(request)
+        for header, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(header, value)
+        return response
 
     # --- pages ---------------------------------------------------------------------------
 
@@ -171,14 +191,14 @@ def create_app(
 
         job = jobs.start("up", spec.name, lambda record: runtime.up(spec, on_event=record))
         jobs.prune()
-        return {"job": job.to_dict(), "name": spec.name}
+        return {"job": jobs.snapshot(job.id), "name": spec.name}
 
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: str):
-        job = jobs.get(job_id)
-        if job is None:
+        snapshot = jobs.snapshot(job_id)
+        if snapshot is None:
             raise HTTPException(status_code=404, detail="no such job")
-        return job.to_dict()
+        return snapshot
 
     @app.post("/api/instances/{name}/actions/{action}")
     def act(name: str, action: str):
@@ -193,7 +213,7 @@ def create_app(
         _status_or_404(runtime, name)
         job = jobs.start(action, name, lambda record: _run_action(actions[action], name, record))
         jobs.prune()
-        return {"job": job.to_dict()}
+        return {"job": jobs.snapshot(job.id)}
 
     @app.post("/api/instances/{name}/query")
     def query(name: str, payload: QueryPayload):
@@ -313,3 +333,18 @@ def _result_dict(result: QueryResult | QueryError, *, limit: int | None = None) 
         "rows_read": result.rows_read,
         "elapsed": result.elapsed,
     }
+
+
+def _cross_site_refusal(request: Request, permitted: frozenset[str]) -> str | None:
+    """Why a state-changing request looks cross-site, or None if it does not."""
+    if request.headers.get(CSRF_HEADER) != "1":
+        return f"state-changing requests must carry the {CSRF_HEADER}: 1 header"
+    site = request.headers.get("sec-fetch-site")
+    if site not in (None, "same-origin", "none"):
+        return f"cross-site request refused (Sec-Fetch-Site: {site})"
+    origin = request.headers.get("origin")
+    if origin and permitted:
+        host = urlsplit(origin).hostname or ""
+        if host not in permitted and f"[{host}]" not in permitted:
+            return f"cross-origin request refused (Origin: {origin})"
+    return None

@@ -18,6 +18,9 @@ from .errors import ChlabError
 
 CHUNK_SIZE = 1 << 20
 USER_AGENT = "chlab"
+#: Seconds a connection may sit silent — connecting, or between two reads — before the
+#: download is abandoned. Not a limit on the whole transfer: a debug build is gigabytes.
+READ_TIMEOUT = 120
 
 #: ``(downloaded_bytes, total_bytes_or_None)``, called repeatedly during transfer.
 ProgressCallback = Callable[[int, int | None], None]
@@ -29,6 +32,22 @@ class DownloadError(ChlabError):
 
 class ChecksumError(ChlabError):
     pass
+
+
+class _NoDowngrade(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, except from https:// to plain http://.
+
+    urllib follows a downgrade silently, which would undo the transport protection the user
+    asked for by typing https:// — and the plain-HTTP warning only sees the first URL.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.full_url.startswith("https://") and not newurl.startswith("https://"):
+            raise DownloadError(f"{req.full_url} redirects to {newurl}, which is not https://")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_NoDowngrade)
 
 
 def download(
@@ -54,7 +73,7 @@ def download(
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
     try:
-        with urllib.request.urlopen(request) as response:
+        with _opener.open(request, timeout=READ_TIMEOUT) as response:
             total = _content_length(response)
             downloaded = 0
             if on_progress:
@@ -79,6 +98,11 @@ def download(
     except urllib.error.URLError as error:
         partial.unlink(missing_ok=True)
         raise DownloadError(f"could not fetch {url}: {error.reason}") from error
+    except TimeoutError as error:
+        partial.unlink(missing_ok=True)
+        raise DownloadError(
+            f"{url} sent nothing for {READ_TIMEOUT}s; the transfer was abandoned"
+        ) from error
     except BaseException:
         partial.unlink(missing_ok=True)
         raise

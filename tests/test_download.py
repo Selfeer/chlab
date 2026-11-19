@@ -36,6 +36,15 @@ def http_root(tmp_path: Path):
         thread.join(timeout=5)
 
 
+@pytest.fixture(autouse=True)
+def container_probe_on_host(monkeypatch):
+    """A downloaded binary's version is read only in a container. The fakes here are shell
+    scripts, so stand the container in with the host rather than need Docker for unit tests."""
+    from chlab.core import resolve as resolve_module
+
+    monkeypatch.setattr(resolve_module, "_container_probe", resolve_module._host_probe)
+
+
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args):  # keep pytest output clean
         pass

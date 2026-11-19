@@ -354,7 +354,10 @@ builds behaved differently.
 | `.spark` | Spark SQL, with `spark` in `with:` |
 
 Steps run with the reproduction directory as their working directory, so data files next to
-them (`data.csv`, a crafted Parquet file) are at hand. Expectations:
+them (`data.csv`, a crafted Parquet file) are at hand. Nothing a reproduction runs touches the
+rest of the host: SQL, `.sh`, `.py` and `.spark` run in containers, and `.chlab` steps may name
+only their own instance and read or write only files inside the directory. A build named in
+`repro.yaml` is never executed on the host. The containers do have network access. Expectations:
 
 | | |
 |---|---|
@@ -451,6 +454,7 @@ sees each row exactly once. Columns: `event_time`, `user_id`, `event_type`, `cou
 ```bash
 chlab ui                    # localhost:7777, opens a browser
 chlab ui --port 8080 --no-open
+# loopback only: the API is unauthenticated. From another machine: ssh -L 7777:127.0.0.1:7777 host
 ```
 
 A setup form for topology, users, databases and seed data; a dashboard of running instances

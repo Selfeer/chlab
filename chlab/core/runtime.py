@@ -92,9 +92,13 @@ class Runtime:
         force_resolve: bool = False,
         recreate: bool = False,
         sha256: str | None = None,
+        trust_local: bool = True,
         on_event: EventCallback | None = None,
     ) -> InstanceStatus:
-        """Resolve, generate, launch, wait, and initialise."""
+        """Resolve, generate, launch, wait, and initialise.
+
+        ``trust_local=False`` is for a source someone else chose (see ``resolve``).
+        """
         notify = on_event or (lambda _message: None)
 
         if self.registry.exists(spec.name):
@@ -111,6 +115,7 @@ class Runtime:
             version=spec.version,
             force=force_resolve,
             sha256=sha256,
+            trust_local=trust_local,
             cache=self.cache,
             on_event=notify,
         )
@@ -202,9 +207,21 @@ class Runtime:
         self._compose(self.registry.load(name), "down", "--remove-orphans")
 
     def destroy(self, name: str) -> None:
-        """Remove containers, volumes and the instance definition."""
+        """Remove containers, volumes and the instance definition.
+
+        The definition goes only once Docker has removed the rest: if compose fails, the
+        containers and volumes may still be there, and without the definition chlab could no
+        longer find or remove them. (Compose succeeds for a project that is already gone.)
+        """
         spec = self.registry.load(name)
-        self._compose(spec, "down", "--volumes", "--remove-orphans", check=False)
+        try:
+            self._compose(spec, "down", "--volumes", "--remove-orphans")
+        except (ClusterError, OSError, subprocess.SubprocessError) as failure:
+            raise ClusterError(
+                f"could not remove {name}'s containers and volumes, so its definition is kept "
+                f"for another try: {failure}\nTo forget it anyway, delete "
+                f"{self.registry.instance_dir(name)}"
+            ) from failure
         self.registry.delete(name)
 
     # --- inspection ----------------------------------------------------------------------

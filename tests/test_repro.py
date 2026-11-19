@@ -220,11 +220,13 @@ class FakeRuntime:
         self.cache = Cache(registry.root.parent / "cache")
         self.fail_up = fail_up
         self.destroyed: list[str] = []
+        self.trusted: dict[str, bool] = {}
 
-    def up(self, spec, on_event=None):
+    def up(self, spec, trust_local=True, on_event=None):
         from chlab.core.runtime import ClusterError, InstanceStatus
         from chlab.core.topology import build_topology
 
+        self.trusted[spec.source] = trust_local
         if self.fail_up:
             raise ClusterError("clickhouse1 did not become healthy")
         spec = spec.with_ports(21000).with_version("9.9.9." + spec.source[-1])
@@ -247,7 +249,7 @@ def registry(tmp_path: Path):
 
 
 def fake_subprocess(monkeypatch, behaviour):
-    def run(command, input=None, cwd=None, env=None, capture_output=True, text=True, timeout=None):
+    def run(command, input=None, cwd=None, env=None, timeout=None, **kwargs):
         exit_code, stdout, stderr = behaviour(command, input)
         return subprocess.CompletedProcess(command, exit_code, stdout, stderr)
 
@@ -366,7 +368,9 @@ def test_init_then_check(isolated: Path):
 
 def _stub_run(monkeypatch, run_result):
     monkeypatch.setattr(
-        repro.Runner, "run", lambda self, loaded, sources, keep=False: run_result(sources)
+        repro.Runner,
+        "run",
+        lambda self, loaded, sources, keep=False, untrusted=(): run_result(sources),
     )
 
 

@@ -23,6 +23,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from .core import confine
 from .core import profiles as profiles_module
 from .core.cache import Cache
 from .core.errors import ChlabError
@@ -596,7 +597,9 @@ def _run_sql_file(runtime: Runtime, name: str, file: str, *, node, all_nodes, **
     import sys
 
     try:
-        script = sys.stdin.read() if file == "-" else Path(file).read_text()
+        script = sys.stdin.read() if file == "-" else confine.local_path(file).read_text()
+    except ChlabError as failure:
+        _fail(failure)
     except OSError as failure:
         _fail(SpecError(f"could not read {file}: {failure.strerror or failure}"))
 
@@ -696,12 +699,20 @@ def cp_command(
             instance,
             service=node,
             container_path=container_path,
-            host_path=source if to_container else destination,
+            host_path=_host_side(source if to_container else destination),
             to_container=to_container,
         )
     except ChlabError as failure:
         _fail(failure)
     raise typer.Exit(code=subprocess.call(docker_command))
+
+
+def _host_side(text: str) -> str:
+    # Checked, but passed on as written: docker cp gives a trailing / meaning. `-` is its
+    # tar stream on stdin/stdout, not a file.
+    if text != "-":
+        confine.local_path(text)
+    return text
 
 
 def _remote_path(text: str, registry: Registry) -> tuple[str, str | None, str] | None:
@@ -819,7 +830,7 @@ def py_command(
         if script == "-":
             command, mounts, stdin = ["python", "-", *ctx.args], [], True
         else:
-            path = Path(script).expanduser().resolve()
+            path = confine.local_path(script)
             if not path.is_file():
                 raise SpecError(f"{script} is not a file")
             target = f"/chlab/run/{path.name}"
@@ -899,7 +910,7 @@ def spark_command(
         if file == "-":
             statements = sys.stdin.read()
         elif file is not None:
-            statements = Path(file).read_text()
+            statements = confine.local_path(file).read_text()
         else:
             statements = sql
     except OSError as failure:
@@ -1153,13 +1164,13 @@ def repro_run(
                 colour = "green" if message.endswith("passed") else "red"
                 events.print(f"[{colour}]{escape(message)}[/{colour}]")
 
-        run = repro.Runner(on_event=notify).run(loaded, sources, keep=keep)
+        untrusted = [source for source in sources if source not in (clickhouse, compare)]
+        run = repro.Runner(on_event=notify).run(loaded, sources, keep=keep, untrusted=untrusted)
 
-    stamp = run.started.replace(":", "").replace("-", "")
-    destination = out or (loaded.directory / "results" / stamp)
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "result.json").write_text(jsonlib.dumps(run.to_dict(), indent=2) + "\n")
-    (destination / "report.md").write_text(repro.markdown(run))
+    try:
+        destination = repro.write_results(run, loaded.directory, out)
+    except (ChlabError, OSError) as failure:
+        _fail(failure)
 
     if json:
         console.print_json(jsonlib.dumps(run.to_dict()))
@@ -1250,7 +1261,10 @@ def s3_put(
     *sources, destination = paths
     mounts, inside = [], []
     for index, source in enumerate(sources):
-        local = Path(source).expanduser()
+        try:
+            local = confine.local_path(source)
+        except ChlabError as failure:
+            _fail(failure)
         if not local.exists():
             _fail(SpecError(f"{source} does not exist"))
         target = f"/chlab-in/{index}/{local.resolve().name}"
@@ -1274,7 +1288,10 @@ def s3_get(
     """Download an object, or a prefix recursively."""
     from .core.services.s3 import object_path
 
-    local = Path(destination).expanduser().resolve()
+    try:
+        local = confine.local_path(destination)
+    except ChlabError as failure:
+        _fail(failure)
     if local.is_dir():
         mount, target = local, "/chlab-out/"
     else:
@@ -1394,7 +1411,9 @@ def profiles_rm(profile_name: Annotated[str, typer.Argument(help="Profile to del
 @app.command("ui")
 def ui_command(
     port: Annotated[int, typer.Option("--port", help="Port to serve on.")] = 7777,
-    host: Annotated[str, typer.Option("--host", help="Address to bind.")] = "127.0.0.1",
+    host: Annotated[
+        str, typer.Option("--host", help="Loopback address to bind: 127.0.0.1, localhost or ::1.")
+    ] = "127.0.0.1",
     open_browser: Annotated[
         bool, typer.Option("--open/--no-open", help="Open a browser window.")
     ] = True,
@@ -1406,9 +1425,14 @@ def ui_command(
 
     url = f"http://{host}:{port}"
     if host not in {"127.0.0.1", "localhost", "::1"}:
-        error_console.print(
-            f"[bold yellow]warning:[/bold yellow] binding to {host} exposes an unauthenticated "
-            "API that runs SQL and deletes clusters to everyone who can reach this machine."
+        # The API is unauthenticated, runs SQL, deletes clusters and returns saved profiles
+        # with their passwords; it answers only on loopback names in any case.
+        _fail(
+            SpecError(
+                f"chlab ui serves only on loopback, not {host}: its API has no "
+                "authentication. To reach it from another machine, forward the port: "
+                f"ssh -L {port}:127.0.0.1:{port} <this host>"
+            )
         )
     console.print(f"chlab ui on [bold]{url}[/bold]")
     if open_browser:

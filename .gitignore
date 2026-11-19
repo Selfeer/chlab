@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 CODE_REVIEW.md
 examples/**/results/
+build/

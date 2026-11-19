@@ -39,6 +39,7 @@ BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 MIN_S3_SECRET_LENGTH = 8
 S3_ACCESS_LEVELS = ("readwrite", "readonly", "writeonly")
 #: A ClickHouse config element name. Keys become XML tags, which ElementTree will not validate.
+CLUSTER_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 SETTING_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
@@ -169,6 +170,12 @@ class ClusterSpec:
             raise SpecError(
                 f"instance name {self.name!r} must be lowercase letters, digits, '-' or '_', "
                 "starting with a letter or digit, at most 31 characters"
+            )
+        if not CLUSTER_NAME_PATTERN.match(self.cluster_name):
+            # It is an element name in remote_servers and a name in cluster() SQL.
+            raise SpecError(
+                f"cluster name {self.cluster_name!r} must be letters, digits and '_', "
+                "not starting with a digit"
             )
         if self.shards < 1 or self.replicas < 1:
             raise SpecError("shards and replicas must both be at least 1")

@@ -34,18 +34,21 @@ from __future__ import annotations
 
 import datetime
 import difflib
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Collection
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from . import confine
 from . import profiles as profiles_module
 from .errors import ChlabError
 from .events import EventCallback, silent
@@ -408,14 +411,29 @@ class Runner:
         self.runtime = runtime or Runtime()
         self.notify = on_event or silent
 
-    def run(self, repro: Repro, sources: list[str], *, keep: bool = False) -> ReproRun:
+    def run(
+        self,
+        repro: Repro,
+        sources: list[str],
+        *,
+        keep: bool = False,
+        untrusted: Collection[str] = (),
+    ) -> ReproRun:
+        """Run ``repro`` on each build in ``sources``.
+
+        ``untrusted`` are the sources taken from repro.yaml rather than the command line. A
+        local path among them is never executed on the host (see ``resolve``): whoever wrote
+        the reproduction should not be able to run a program outside Docker by naming it.
+        """
         started = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         taken = {spec.name for spec in self.runtime.registry.list()}
         builds = []
         for index, source in enumerate(sources, start=1):
             name = _instance_name(repro.directory.name, index, taken)
             taken.add(name)
-            builds.append(self._run_build(repro, source, name, keep=keep))
+            builds.append(
+                self._run_build(repro, source, name, keep=keep, trusted=source not in untrusted)
+            )
 
         run = ReproRun(
             title=repro.title, directory=str(repro.directory), started=started, builds=builds
@@ -424,13 +442,17 @@ class Runner:
             run.differences = _differences(builds[0], builds[1])
         return run
 
-    def _run_build(self, repro: Repro, source: str, name: str, *, keep: bool) -> BuildRun:
+    def _run_build(
+        self, repro: Repro, source: str, name: str, *, keep: bool, trusted: bool = True
+    ) -> BuildRun:
         build = BuildRun(source=source, instance=name)
         spec = ClusterSpec(name=name, source=source, **repro.fields)
         self.notify(f"{source}: launching {name}")
         try:
             try:
-                status = self.runtime.up(spec, on_event=lambda m: self.notify(f"{name}: {m}"))
+                status = self.runtime.up(
+                    spec, trust_local=trusted, on_event=lambda m: self.notify(f"{name}: {m}")
+                )
             except ChlabError as failure:
                 build.error = str(failure)
                 return build
@@ -458,8 +480,10 @@ class Runner:
             completed = subprocess.run(
                 command,
                 input=stdin,
+                # Without input, not the terminal's stdin: a step must not wait on the user.
+                stdin=subprocess.DEVNULL if stdin is None else None,
                 cwd=cwd,
-                env=self._child_env() if step.kind == "chlab" else None,
+                env=self._child_env(spec.name, directory) if step.kind == "chlab" else None,
                 capture_output=True,
                 text=True,
                 timeout=step.timeout,
@@ -490,8 +514,12 @@ class Runner:
             diff=diff,
         )
 
-    def _child_env(self) -> dict[str, str]:
-        """.chlab steps run the CLI as a child; it must see the instances this runner sees."""
+    def _child_env(self, instance: str, directory: Path) -> dict[str, str]:
+        """.chlab steps run the CLI as a child; it must see the instances this runner sees.
+
+        It is also confined (see ``confine``): to this run's instance, and to the
+        reproduction's directory for any host file it reads or writes.
+        """
         from .cache import ENV_CACHE_DIR
         from .registry import ENV_STATE_DIR
 
@@ -499,6 +527,7 @@ class Runner:
             **os.environ,
             ENV_STATE_DIR: str(self.runtime.registry.root),
             ENV_CACHE_DIR: str(self.runtime.cache.root),
+            **confine.environment(instance, directory),
         }
 
     def _command(
@@ -728,3 +757,36 @@ def init(directory: Path, *, title: str | None = None, services: list[str] | Non
     step = directory / "01-setup.sql"
     if not step.exists():
         step.write_text(INIT_STEP)
+
+
+def write_results(run: ReproRun, directory: Path, destination: Path | None) -> Path:
+    """Write result.json and report.md, returning the directory they are in.
+
+    The default destination is under the reproduction directory, which its steps can write
+    to (the tools container mounts it). So the path is resolved and must stay inside, and the
+    files replace whatever is there — a symlink planted at either name is replaced, not
+    followed.
+    """
+    if destination is None:
+        stamp = run.started.replace(":", "").replace("-", "")
+        destination = directory / "results" / stamp
+        resolved = destination.resolve()
+        if not resolved.is_relative_to(directory.resolve()):
+            raise ReproError(
+                f"{destination} leads outside {directory} (a symlink?); pass --out to write the "
+                "results elsewhere"
+            )
+        destination = resolved
+    destination.mkdir(parents=True, exist_ok=True)
+    _replace(destination / "result.json", json.dumps(run.to_dict(), indent=2) + "\n")
+    _replace(destination / "report.md", markdown(run))
+    return destination
+
+
+def _replace(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.part")
+    temporary.unlink(missing_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(temporary, flags, 0o644), "w") as handle:
+        handle.write(text)
+    os.replace(temporary, path)

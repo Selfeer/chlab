@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .cache import Cache, cache_key
-from .download import ProgressCallback, copy_local, download, verify_sha256
+from .download import ChecksumError, ProgressCallback, copy_local, download, verify_sha256
 from .errors import ChlabError
 from .sources import ArtifactType, Source, SourceKind, parse_source, version_from_image_tag
 from .unpack import extract_binary
@@ -55,6 +55,7 @@ def resolve(
     version: str | None = None,
     force: bool = False,
     sha256: str | None = None,
+    trust_local: bool = True,
     cache: Cache | None = None,
     on_event: EventCallback | None = None,
     on_progress: ProgressCallback | None = None,
@@ -63,7 +64,11 @@ def resolve(
 
     ``version`` overrides detection entirely, mirroring ``--clickhouse-version`` in Altinity's
     regression suite. ``force`` re-downloads and re-detects, ignoring the cache. ``sha256``,
-    when given, must match the downloaded artifact.
+    when given, must match the artifact — downloaded, cached or local.
+
+    ``trust_local`` says whether a local path came from the user. Set it to False for a path
+    named by a file someone else wrote, such as a reproduction's ``repro.yaml``: the binary is
+    then only ever executed inside a container, as a downloaded one is.
     """
     source = parse_source(raw)
     cache = cache or Cache.default()
@@ -78,7 +83,8 @@ def resolve(
 
     if source.is_docker:
         return _resolve_docker(source, key, cache, version, force, notify)
-    return _resolve_file(source, key, cache, version, force, sha256, notify, on_progress)
+    trusted = trust_local and source.kind is SourceKind.PATH
+    return _resolve_file(source, key, cache, version, force, sha256, trusted, notify, on_progress)
 
 
 def _resolve_docker(
@@ -133,35 +139,53 @@ def _resolve_file(
     version: str | None,
     force: bool,
     sha256: str | None,
+    trusted: bool,
     notify: EventCallback,
     on_progress: ProgressCallback | None,
 ) -> Resolved:
+    meta = cache.read_meta(key) or {}
+    expected = sha256.strip().lower() if sha256 else None
     if source.kind is SourceKind.PATH and source.artifact is ArtifactType.BINARY:
         # A local binary is used where it lies — no point copying gigabytes into the cache,
         # and it keeps `--clickhouse ./build/clickhouse` tracking a live build tree.
         binary_path = _local_binary(source)
-        cached = cache.read_meta(key) is not None and not force
+        if expected:
+            verify_sha256(binary_path, expected)
+        cached = bool(meta) and not force
     else:
         binary_path = cache.bin_dir(key) / PROGRAM
         cached = binary_path.exists() and not force
+        if cached and expected and meta.get("artifact_sha256") != expected:
+            # The extracted binary came from an artifact nobody checked against this digest:
+            # fetch (or re-verify) the artifact and extract again rather than trust it.
+            cached = False
         if not cached:
-            package = _fetch_artifact(source, key, cache, force, sha256, notify, on_progress)
+            package = _fetch_artifact(source, key, cache, force, expected, notify, on_progress)
             if source.artifact is ArtifactType.BINARY:
                 binary_path = _install_binary(package, binary_path)
             else:
                 notify(f"unpacking {package.name}")
                 binary_path = extract_binary(package, PROGRAM, binary_path)
+            # A fresh binary may not be the one the cached version was read from.
+            force = True
 
     detected = version or _cached_version(cache, key, force)
     if detected is None:
-        detected = _version_from_binary(binary_path, trusted=source.kind is SourceKind.PATH)
+        detected = _version_from_binary(binary_path, trusted=trusted)
         if detected is None:
             raise ResolveError(
                 f"could not determine the ClickHouse version of {binary_path}; "
                 "pass --clickhouse-version to set it explicitly"
             )
 
-    _write_meta(cache, key, source, detected, binary_path=binary_path)
+    _write_meta(
+        cache,
+        key,
+        source,
+        detected,
+        binary_path=binary_path,
+        artifact_sha256=expected or (meta.get("artifact_sha256") if cached else None),
+    )
     return Resolved(source=source, version=detected, binary_path=binary_path, cached=cached)
 
 
@@ -178,6 +202,13 @@ def _fetch_artifact(
     if source.kind is SourceKind.URL:
         filename = source.filename or PROGRAM
         dest = cache.artifact_dir(key) / filename
+        if dest.exists() and not force and sha256:
+            try:
+                verify_sha256(dest, sha256)
+            except ChecksumError:
+                # A cached download that does not match is replaced, not trusted.
+                notify(f"cached {filename} does not match --sha256; downloading it again")
+                force = True
         if not dest.exists() or force:
             notify(f"downloading {filename}")
         return download(source.value, dest, force=force, sha256=sha256, on_progress=on_progress)
@@ -226,18 +257,17 @@ def _version_from_binary(binary: Path, *, trusted: bool) -> str | None:
     """Ask the binary for its version.
 
     Determining the version means executing the artifact, so where that happens matters. A
-    binary that was just downloaded from a URL runs **in a container first** — running it on
-    the host would make ``chlab up -c http://…`` remote code execution on the host, which is
-    exactly the isolation the rest of the design is built on.
+    binary chlab did not get from the user directly — downloaded from a URL, or named by a
+    reproduction's repro.yaml — runs **only in a container**, with no network. Running it on
+    the host, even as a fallback, would let a hostile artifact fail the container probe on
+    purpose and get executed outside Docker, so there is no fallback: the version must then
+    be given with ``--clickhouse-version``.
 
-    A binary the user already had on disk (``trusted``) is run on the host first instead:
-    they chose that file, and requiring Docker to read a local build's version would break
-    working offline. The result is cached either way, so the cost is one container start.
+    A binary the user named on the command line (``trusted``) is run on the host first
+    instead: they chose that file, and requiring Docker to read a local build's version
+    would break working offline. The result is cached either way.
     """
-    attempts = [_host_probe, _container_probe]
-    if not trusted:
-        attempts.reverse()
-
+    attempts = [_host_probe, _container_probe] if trusted else [_container_probe]
     for attempt in attempts:
         output = attempt(binary)
         if output:
@@ -326,6 +356,7 @@ def _write_meta(
     *,
     docker_image: str | None = None,
     binary_path: Path | None = None,
+    artifact_sha256: str | None = None,
 ) -> None:
     cache.write_meta(
         key,
@@ -336,6 +367,7 @@ def _write_meta(
             "version": version,
             "docker_image": docker_image,
             "binary_path": str(binary_path) if binary_path else None,
+            "artifact_sha256": artifact_sha256,
             "resolved_at": int(time.time()),
         },
     )
