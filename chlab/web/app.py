@@ -55,6 +55,8 @@ class CreatePayload(BaseModel):
     databases: list[DatabasePayload] = Field(default_factory=list)
     settings: dict[str, str] = Field(default_factory=dict)
     profile_settings: dict[str, str] = Field(default_factory=dict)
+    services: list[str] = Field(default_factory=list)
+    buckets: list[str] = Field(default_factory=list)
     seed: bool = False
     save_as_profile: str | None = None
 
@@ -157,6 +159,8 @@ def create_app(
                 ),
                 settings=payload.settings,
                 profile_settings=payload.profile_settings,
+                services=tuple(payload.services),
+                buckets=tuple(bucket for bucket in payload.buckets if bucket.strip()),
                 seed=payload.seed,
             )
         except SpecError as failure:
@@ -290,6 +294,7 @@ def _status_dict(status: InstanceStatus) -> dict[str, Any]:
         "keepers": [
             {"name": keeper.name, "port": keeper.client_port} for keeper in status.topology.keepers
         ],
+        "services": [service.name for service in status.topology.services],
     }
 
 

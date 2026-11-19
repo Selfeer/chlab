@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from . import compose, configgen, seed
+from . import services as companions
 from .cache import Cache
 from .errors import ChlabError
 from .image import ensure_base_image
@@ -328,19 +329,27 @@ class Runtime:
         password: str = "",
         database: str | None = None,
         settings: dict[str, str] | None = None,
+        query_id: str | None = None,
     ):
         """Run a query against a single node, defaulting to the first. See query_all for fan-out."""
-        status = self.status(name)
-        target = status.topology.node(node) if node else status.topology.nodes[0]
-        return execute(
-            target.http_url,
-            sql,
-            user=user,
-            password=password,
-            database=database,
-            settings=settings,
-            node=target.name,
-        )
+        topology = build_topology(self.registry.load(name))
+        target = topology.node(node) if node else topology.nodes[0]
+        try:
+            result = execute(
+                target.http_url,
+                sql,
+                user=user,
+                password=password,
+                database=database,
+                settings=settings,
+                node=target.name,
+                query_id=query_id,
+            )
+        except QueryError as failure:
+            failure.query_id = query_id
+            raise
+        result.query_id = query_id
+        return result
 
     def query_all(
         self,
@@ -351,18 +360,23 @@ class Runtime:
         password: str = "",
         database: str | None = None,
         settings: dict[str, str] | None = None,
+        query_id: str | None = None,
     ) -> list:
         """Run the same query on every node; failures come back as QueryError values.
+
+        With ``query_id``, each node's query gets ``<query_id>-<node>``: query IDs are unique
+        per server, and these are separate queries.
 
         Nodes are queried concurrently. Serially, a query that times out everywhere would take
         the timeout multiplied by the node count — half an hour at the 30-node maximum — which
         defeats the point of a fan-out.
         """
-        status = self.status(name)
+        topology = build_topology(self.registry.load(name))
 
         def run(node: Node):
+            node_query_id = f"{query_id}-{node.name}" if query_id else None
             try:
-                return execute(
+                result = execute(
                     node.http_url,
                     sql,
                     user=user,
@@ -370,19 +384,66 @@ class Runtime:
                     database=database,
                     settings=settings,
                     node=node.name,
+                    query_id=node_query_id,
                 )
             except QueryError as failure:
+                failure.query_id = node_query_id
                 return failure
+            result.query_id = node_query_id
+            return result
 
-        return _in_parallel(run, status.topology.nodes)
+        return _in_parallel(run, topology.nodes)
+
+    def profile_events(self, name: str, query_id: str, pattern: str = "") -> dict[str, int]:
+        """ProfileEvents of a finished query, summed over every node that took part in it.
+
+        A query on a Distributed table, or through ``s3Cluster``, does part of its work on
+        other nodes under the same ``initial_query_id`` — so "how many S3 GETs did this
+        query make" has to be asked of the whole cluster. ``pattern`` is a regular expression
+        over event names (``S3|ReadBuffer``); empty means all non-zero events.
+        """
+        topology = build_topology(self.registry.load(name))
+        # Each server buffers its query log; flush them all, not just the one we read from.
+        _in_parallel(lambda node: execute(node.http_url, "SYSTEM FLUSH LOGS"), topology.nodes)
+        sql = (
+            "SELECT event, sum(value) FROM clusterAllReplicas("
+            f"{seed.quote(topology.spec.cluster_name)}, system.query_log) "
+            "ARRAY JOIN mapKeys(ProfileEvents) AS event, mapValues(ProfileEvents) AS value "
+            f"WHERE initial_query_id = {seed.quote(query_id)} AND type != 'QueryStart' "
+            f"AND match(event, {seed.quote(pattern)}) AND value != 0 "
+            "GROUP BY event ORDER BY event"
+        )
+        result = execute(topology.nodes[0].http_url, sql)
+        return {row[0]: int(row[1]) for row in result.rows}
 
     # --- internals -----------------------------------------------------------------------
 
     def _wait_healthy(self, topology: Topology, *, notify: EventCallback | None = None) -> None:
         notify = notify or (lambda _message: None)
+        self._wait_services(topology, notify=notify)
         self._wait_keepers(topology, notify=notify)
         self._wait_nodes(topology, notify=notify)
         self._wait_zookeeper_sessions(topology, notify=notify)
+
+    def _wait_services(self, topology: Topology, *, notify: EventCallback) -> None:
+        active = list(companions.active(topology))
+        if not active:
+            return
+        notify(f"waiting for {', '.join(service.name for service, _ in active)}")
+        deadline = time.monotonic() + HEALTH_TIMEOUT
+        pending = active
+        while pending and time.monotonic() < deadline:
+            ready = _in_parallel(lambda item: item[0].is_ready(topology, item[1]), pending)
+            pending = [item for item, ok in zip(pending, ready, strict=True) if not ok]
+            if pending:
+                time.sleep(HEALTH_INTERVAL)
+
+        if pending:
+            names = ", ".join(service.name for service, _ in pending)
+            raise ClusterError(
+                f"{names} did not become ready within {HEALTH_TIMEOUT}s\n\n"
+                + self._tail_service_logs(topology.spec, [service.name for service, _ in pending])
+            )
 
     def _wait_keepers(self, topology: Topology, *, notify: EventCallback) -> None:
         """Keeper listens only once its Raft election settles."""
@@ -458,6 +519,14 @@ class Runtime:
             )
 
     def _initialise(self, topology: Topology, *, notify: EventCallback) -> None:
+        for service, endpoint in companions.active(topology):
+            try:
+                service.initialise(topology, endpoint, notify)
+            except ChlabError as failure:
+                raise InitError(
+                    f"the cluster is running, but setting up {service.name} failed:\n{failure}"
+                ) from failure
+
         plan = seed.build_plan(topology)
         if not plan.common and not plan.has_seed:
             return
@@ -501,14 +570,17 @@ class Runtime:
         return not result.rows or int(result.rows[0][0]) == 0
 
     def _tail_logs(self, spec: ClusterSpec, nodes: Iterable[Node]) -> str:
+        return self._tail_service_logs(spec, [node.name for node in nodes])
+
+    def _tail_service_logs(self, spec: ClusterSpec, services: Iterable[str]) -> str:
         chunks = []
-        for node in nodes:
+        for service in services:
             result = subprocess.run(
-                self._compose_command(spec, "logs", f"--tail={LOG_TAIL_ON_FAILURE}", node.name),
+                self._compose_command(spec, "logs", f"--tail={LOG_TAIL_ON_FAILURE}", service),
                 capture_output=True,
                 text=True,
             )
-            chunks.append(f"--- {node.name} ---\n{result.stdout.strip() or '(no output)'}")
+            chunks.append(f"--- {service} ---\n{result.stdout.strip() or '(no output)'}")
         return "\n\n".join(chunks)
 
     def _compose_command(self, spec: ClusterSpec, *args: str) -> list[str]:

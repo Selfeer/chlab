@@ -98,6 +98,7 @@ chlab restart     restart nodes and wait until they are ready
 chlab down        remove containers, keep data and definition
 chlab rm          delete everything, including data volumes
 chlab ui          web interface
+chlab s3          buckets and objects of the s3 service
 chlab profiles    saved topologies
 chlab resolve     resolve a source without launching
 chlab cache       inspect or clear the artifact cache
@@ -117,6 +118,9 @@ chlab cache       inspect or clear the artifact cache
 | `-d`, `--database` | `name[:Atomic\|Replicated]`. Repeatable |
 | `--setting` | Server setting (`config.d`) as `key=value`. Repeatable |
 | `--query-setting` | Query setting for every session (default profile), e.g. `allow_insert_into_iceberg=1`. Repeatable |
+| `-w`, `--with` | Companion service: `s3`. Repeatable |
+| `--bucket` | Bucket to create in `s3` (default `warehouse`). Repeatable |
+| `--s3-user` | Extra S3 identity, `name:secret[:readwrite\|readonly\|writeonly[:bucket,…]]`. Repeatable |
 | `--seed` | Create the `demo` database with generated rows |
 | `--cluster-name` | Name of the generated cluster (default `default_cluster`) |
 | `-p`, `--profile` | Start from a saved topology |
@@ -153,6 +157,13 @@ A failing query exits 1. With `--json` the failure is part of the output, as
 `clickhouse-client --multiquery` inside the node, stops at the first error, and exits with the
 client's code.
 
+`--events REGEX` also reports the query's `ProfileEvents`, summed over every node that took
+part — the initial query and the pieces `s3Cluster` or a `Distributed` table sent elsewhere:
+
+```bash
+chlab query lab "SELECT sum(x) FROM s3(s3, filename = 'data/*.parquet')" -e 'S3GetObject$|ReadBufferFromS3Bytes'
+```
+
 ### Looking inside
 
 ```bash
@@ -162,6 +173,44 @@ chlab cp ./data.parquet lab:/var/lib/clickhouse/user_files/
 chlab cp lab/clickhouse2:/var/lib/clickhouse/user_files/t/metadata ./metadata
 chlab restart lab --node clickhouse2                    # e.g. does a setting survive reopen?
 chlab env lab --json                                    # ports, containers, network, users
+```
+
+## Object storage
+
+`--with s3` starts [RustFS](https://github.com/rustfs/rustfs) next to the cluster — the same
+S3 server clickhouse-regression's Iceberg suite uses — and wires every node to it.
+
+```bash
+chlab up -c <source> --name lake --with s3 \
+  --bucket warehouse --bucket other \
+  --s3-user reader:readerpass:readonly:warehouse
+
+chlab query lake "INSERT INTO FUNCTION s3(s3, filename = 'data/t.parquet') SELECT number FROM numbers(1000)"
+chlab query lake "SELECT count() FROM s3(s3, filename = 'data/*.parquet')"
+chlab s3 ls lake warehouse -r
+```
+
+- Inside the network the server is `http://s3:9000`; from the host, see `chlab env lake`.
+  Root credentials are `admin` / `password`, as in clickhouse-regression.
+- Every node has named collections: `s3` for the first bucket and `s3_<bucket>` for each, so
+  `s3(s3_other, filename = 'x.csv')` reads the `other` bucket.
+- `--s3-user` identities get a policy scoped to their buckets and access level, so you can test
+  what ClickHouse does when storage refuses a request.
+- chlab's user roles grant nothing on S3. Add it explicitly:
+  `--grant "dev:NAMED COLLECTION ON s3" --grant "dev:READ, WRITE ON S3"`. Older releases spell
+  the second one `S3 ON *.*`.
+
+`chlab s3` runs `mc` in a throwaway container on the instance's network; nothing is installed
+on the host. Paths are `BUCKET/KEY`.
+
+```bash
+chlab s3 put lake ./a.parquet ./tables/ warehouse/in/     # files and directories
+chlab s3 get lake warehouse/in/ ./out                     # an object or a whole prefix
+chlab s3 cat lake warehouse/t/metadata/v3.metadata.json
+chlab s3 rm  lake warehouse/in -r
+chlab s3 mb  lake scratch
+chlab s3 ls  lake other --as reader                       # act as an --s3-user identity
+chlab s3 mc  lake -- stat s3/warehouse/in/a.parquet       # anything else mc can do
 ```
 
 ## Examples

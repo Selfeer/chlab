@@ -435,3 +435,178 @@ def test_env_json_describes_how_to_reach_the_instance(saved_instance):
 
 def test_env_reports_an_unknown_instance():
     assert invoke("env", "nope").exit_code == 1
+
+
+# --- services and s3 ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def s3_instance(isolated_state: Path) -> ClusterSpec:
+    from chlab.core.spec import S3UserSpec
+
+    spec = ClusterSpec(
+        name="lake",
+        source="/bin/clickhouse",
+        port_base=21000,
+        services=("s3",),
+        s3_users=(S3UserSpec("reader", "readerpass", "readonly"),),
+    )
+    Registry().save(spec)
+    return spec
+
+
+def capture_call(monkeypatch) -> list:
+    calls: list = []
+    monkeypatch.setattr("subprocess.call", lambda command: calls.append(command) or 0)
+    return calls
+
+
+def test_up_accepts_services_buckets_and_s3_users(monkeypatch):
+    seen = captured_spec(monkeypatch)
+    result = invoke(
+        "up",
+        "-c",
+        "/x",
+        "-n",
+        "lake",
+        "--with",
+        "s3",
+        "--bucket",
+        "warehouse",
+        "--bucket",
+        "other",
+        "--s3-user",
+        "reader:readerpass:readonly:other",
+    )
+    assert result.exit_code == 0, result.output
+    spec = seen["spec"]
+    assert spec.services == ("s3",)
+    assert spec.buckets == ("warehouse", "other")
+    assert spec.s3_users[0].buckets == ("other",)
+
+
+def test_buckets_without_s3_are_refused_before_launch(monkeypatch):
+    captured_spec(monkeypatch)
+    result = invoke("up", "-c", "/x", "-n", "lake", "--bucket", "data")
+    assert result.exit_code == 1
+    assert "--with s3" in result.output
+
+
+def test_s3_commands_need_the_s3_service(saved_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    result = invoke("s3", "ls", "lab")
+    assert result.exit_code == 1
+    assert "no s3 service" in result.output
+    assert calls == []
+
+
+def test_s3_ls_lists_through_mc(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "ls", "lake", "warehouse/data", "-r").exit_code == 0
+    assert calls[0][-3:] == ["ls", "--recursive", "s3/warehouse/data"]
+
+
+def test_s3_put_mounts_each_source_read_only(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    (tmp_path / "dir").mkdir()
+    result = invoke(
+        "s3", "put", "lake", str(tmp_path / "a.parquet"), str(tmp_path / "dir"), "warehouse/in/"
+    )
+    assert result.exit_code == 0, result.output
+    command = calls[0]
+    assert f"{tmp_path / 'a.parquet'}:/chlab-in/0/a.parquet:ro" in command
+    assert f"{tmp_path / 'dir'}:/chlab-in/1/dir:ro" in command
+    assert command[-4:] == [
+        "--recursive",
+        "/chlab-in/0/a.parquet",
+        "/chlab-in/1/dir",
+        "s3/warehouse/in/",
+    ]
+
+
+def test_s3_put_reports_a_missing_source(s3_instance, monkeypatch):
+    capture_call(monkeypatch)
+    result = invoke("s3", "put", "lake", "./nope.parquet", "warehouse/")
+    assert result.exit_code == 1 and "does not exist" in result.output
+
+
+def test_s3_get_into_a_directory_mounts_it_writable(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "get", "lake", "warehouse/t/", str(tmp_path)).exit_code == 0
+    assert f"{tmp_path}:/chlab-out" in calls[0]
+    assert calls[0][-2:] == ["s3/warehouse/t/", "/chlab-out/"]
+
+
+def test_s3_get_to_a_new_file_name(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    assert (
+        invoke("s3", "get", "lake", "warehouse/m.json", str(tmp_path / "copy.json")).exit_code == 0
+    )
+    assert calls[0][-1] == "/chlab-out/copy.json"
+
+
+def test_s3_commands_can_act_as_another_user(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "cat", "lake", "warehouse/x", "--as", "reader").exit_code == 0
+    assert "MC_HOST_s3=http://reader:readerpass@s3:9000" in calls[0]
+
+
+def test_s3_mc_passes_arguments_and_stdin_through(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "mc", "lake", "--", "stat", "s3/warehouse/x").exit_code == 0
+    assert "-i" in calls[0] and calls[0][-2:] == ["stat", "s3/warehouse/x"]
+
+
+def test_s3_exit_codes_are_mc_exit_codes(s3_instance, monkeypatch):
+    monkeypatch.setattr("subprocess.call", lambda command: 1)
+    assert invoke("s3", "rm", "lake", "warehouse/x").exit_code == 1
+
+
+def test_query_events_are_reported_per_result(saved_instance, monkeypatch):
+    from chlab.core.query import QueryResult
+
+    def run(self, name, sql, **kwargs):
+        assert kwargs["query_id"].startswith("chlab-")
+        return QueryResult(
+            columns=["x"], rows=[[1]], node="clickhouse1", query_id=kwargs["query_id"]
+        )
+
+    monkeypatch.setattr(Runtime, "query", run)
+    monkeypatch.setattr(
+        Runtime, "profile_events", lambda self, name, query_id, pattern: {"S3GetObject": 4}
+    )
+    result = invoke("query", "lab", "SELECT 1", "--events", "S3", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)[0]["events"] == {"S3GetObject": 4}
+
+
+def test_query_events_are_collected_for_failed_queries_too(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        failure = QueryError("Code: 499. S3_ERROR", node="clickhouse1")
+        failure.query_id = kwargs["query_id"]
+        raise failure
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    monkeypatch.setattr(Runtime, "profile_events", lambda self, *a: {"S3GetObject": 1})
+    result = invoke("query", "lab", "SELECT 1", "-e", ".", "--json")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)[0] == {
+        "node": "clickhouse1",
+        "error": "Code: 499. S3_ERROR",
+        "code": 499,
+        "query_id": json.loads(result.stdout)[0]["query_id"],
+        "events": {"S3GetObject": 1},
+    }
+
+
+def test_profiles_carry_services_and_s3_users(s3_instance):
+    from chlab.core import profiles
+
+    assert invoke("profiles", "save", "lakehouse", "lake").exit_code == 0
+    fields = profiles.apply(profiles.Profiles.default().get("lakehouse"), {})
+    rebuilt = ClusterSpec(name="again", source="/y", **fields)
+    assert rebuilt.services == ("s3",)
+    assert rebuilt.s3_users == s3_instance.s3_users

@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import services as companions
 from .spec import ClusterSpec
 from .topology import (
     CONTAINER_HTTP_PORT,
@@ -63,6 +64,10 @@ def _write_node_configs(
 
     if topology.spec.settings:
         _write_xml(config_d / "50-chlab-settings.xml", server_settings(topology.spec.settings))
+
+    for service, _endpoint in companions.active(topology):
+        for filename, document in service.node_configs(topology).items():
+            _write_xml(config_d / filename, document)
 
     # The declared users are created as SQL objects after start; this only makes sure the
     # default user is allowed to create them.
@@ -118,6 +123,13 @@ def base_config() -> dict[str, Any]:
         "max_connections": 1024,
         "max_concurrent_queries": 100,
         "keep_alive_timeout": 3,
+        # Stock images ship this; a bare binary has no query log unless asked. Reproductions
+        # read ProfileEvents from it (S3 GETs per query, bytes read), so it must exist.
+        "query_log": {
+            "database": "system",
+            "table": "query_log",
+            "flush_interval_milliseconds": 7500,
+        },
     }
 
 

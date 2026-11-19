@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ChlabError
-from .spec import ClusterSpec, DatabaseSpec, UserSpec, construct
+from .spec import ClusterSpec, DatabaseSpec, S3UserSpec, UserSpec, construct
 
 ENV_CONFIG_DIR = "CHLAB_CONFIG_DIR"
 #: Fields a profile never carries, because they identify a particular instance.
@@ -106,6 +106,11 @@ def apply(profile: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
             database if isinstance(database, DatabaseSpec) else construct(DatabaseSpec, database)
             for database in merged["databases"]
         )
+    if "s3_users" in merged:
+        merged["s3_users"] = tuple(
+            user if isinstance(user, S3UserSpec) else construct(S3UserSpec, user)
+            for user in merged["s3_users"]
+        )
     # A profile written by a newer chlab may carry fields this version has never heard of.
     # Dropping them here keeps `--profile` working instead of raising TypeError at the
     # ClusterSpec constructor.
@@ -125,6 +130,8 @@ def summarise(profile: dict[str, Any]) -> str:
         parts.append(f"{len(profile['users'])} user(s)")
     if profile.get("databases"):
         parts.append(f"{len(profile['databases'])} database(s)")
+    if profile.get("services"):
+        parts.append("with " + ", ".join(profile["services"]))
     if profile.get("seed"):
         parts.append("seeded")
     return ", ".join(parts)

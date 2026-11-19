@@ -18,6 +18,17 @@ DEFAULT_USER = "default"
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 #: Also the bound that keeps node ports clear of keeper ports; see topology.KEEPER_PORT_OFFSET.
 MAX_NODES = 30
+#: Bounds the keeper port range, so companion service ports can sit above it.
+MAX_KEEPERS = 9
+#: Companion services ``--with`` accepts. Each has a module in ``chlab.core.services``.
+KNOWN_SERVICES = ("s3",)
+DEFAULT_BUCKET = "warehouse"
+#: S3 bucket naming rules, minus the ones (no IP-address names) no one hits in a lab.
+BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+#: RustFS rejects shorter secrets with "invalid secret key length" — at bucket setup, long
+#: after the command that asked for it. Checked here instead.
+MIN_S3_SECRET_LENGTH = 8
+S3_ACCESS_LEVELS = ("readwrite", "readonly", "writeonly")
 #: A ClickHouse config element name. Keys become XML tags, which ElementTree will not validate.
 SETTING_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
@@ -69,6 +80,41 @@ class DatabaseSpec:
 
 
 @dataclass(frozen=True)
+class S3UserSpec:
+    """An extra object-storage identity, for reproducing access-control behaviour."""
+
+    name: str
+    secret: str
+    #: ``readwrite``, ``readonly`` or ``writeonly``.
+    access: str = "readwrite"
+    #: Buckets the policy covers. Empty means every bucket of the instance.
+    buckets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "buckets", tuple(self.buckets))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{3,64}", self.name or ""):
+            raise SpecError(f"S3 user name {self.name!r} must be 3-64 letters, digits, '_' or '-'")
+        if self.name == S3_ROOT_USER:
+            raise SpecError(f"S3 user {S3_ROOT_USER!r} is the root identity and already exists")
+        if len(self.secret) < MIN_S3_SECRET_LENGTH:
+            raise SpecError(
+                f"S3 user {self.name!r} needs a secret of at least {MIN_S3_SECRET_LENGTH} "
+                "characters; the storage server rejects shorter ones"
+            )
+        if self.access not in S3_ACCESS_LEVELS:
+            raise SpecError(
+                f"unknown S3 access {self.access!r} for {self.name!r}; "
+                f"expected one of {', '.join(S3_ACCESS_LEVELS)}"
+            )
+
+
+#: Root credentials of the s3 service. Fixed and well known on purpose: this is a lab, and
+#: clickhouse-regression uses the same pair, so its snippets work unchanged.
+S3_ROOT_USER = "admin"
+S3_ROOT_PASSWORD = "password"
+
+
+@dataclass(frozen=True)
 class ClusterSpec:
     """A named cluster, ready to be launched."""
 
@@ -90,6 +136,12 @@ class ClusterSpec:
     #: every session and every user — ``allow_insert_into_iceberg`` and friends, which are
     #: not server settings and are silently ignored in config.d.
     profile_settings: dict[str, str] = field(default_factory=dict)
+    #: Companion services started alongside the cluster, from ``KNOWN_SERVICES``.
+    services: tuple[str, ...] = ()
+    #: Buckets created in the s3 service. Empty means just ``DEFAULT_BUCKET``.
+    buckets: tuple[str, ...] = ()
+    #: Extra identities in the s3 service, beyond the root user.
+    s3_users: tuple[S3UserSpec, ...] = ()
     #: First host port of this instance's allocated block; assigned at creation.
     port_base: int | None = None
 
@@ -100,6 +152,9 @@ class ClusterSpec:
         # dataclass is frozen but that only guards rebinding, not the dict's contents.
         object.__setattr__(self, "settings", dict(self.settings))
         object.__setattr__(self, "profile_settings", dict(self.profile_settings))
+        object.__setattr__(self, "services", tuple(self.services))
+        object.__setattr__(self, "buckets", tuple(self.buckets))
+        object.__setattr__(self, "s3_users", tuple(self.s3_users))
 
         if not NAME_PATTERN.match(self.name):
             raise SpecError(
@@ -115,6 +170,9 @@ class ClusterSpec:
             )
         if self.keeper_nodes is not None and self.keeper_nodes < 0:
             raise SpecError("keeper_nodes cannot be negative")
+        if self.effective_keeper_nodes > MAX_KEEPERS:
+            raise SpecError(f"at most {MAX_KEEPERS} keeper nodes are supported")
+        self._validate_services()
         for key in (*self.settings, *self.profile_settings):
             validate_setting_key(key)
         for database in self.databases:
@@ -123,6 +181,45 @@ class ClusterSpec:
                     f"database {database.name!r} uses the Replicated engine, which needs Keeper; "
                     "pass --keeper 1 or more"
                 )
+
+    def _validate_services(self) -> None:
+        for service in self.services:
+            if service not in KNOWN_SERVICES:
+                raise SpecError(
+                    f"unknown service {service!r}; expected one of {', '.join(KNOWN_SERVICES)}"
+                )
+        if len(set(self.services)) != len(self.services):
+            raise SpecError("each service can be requested only once")
+
+        if (self.buckets or self.s3_users) and not self.has_service("s3"):
+            raise SpecError("--bucket and --s3-user need the s3 service; add --with s3")
+        for bucket in self.buckets:
+            if not BUCKET_PATTERN.match(bucket):
+                raise SpecError(
+                    f"invalid bucket name {bucket!r}: 3-63 lowercase letters, digits, '.' or '-'"
+                )
+        if len(set(self.buckets)) != len(self.buckets):
+            raise SpecError("bucket names must be unique")
+
+        names = [user.name for user in self.s3_users]
+        if len(set(names)) != len(names):
+            raise SpecError("S3 user names must be unique")
+        for user in self.s3_users:
+            unknown = [bucket for bucket in user.buckets if bucket not in self.effective_buckets]
+            if unknown:
+                raise SpecError(
+                    f"S3 user {user.name!r} refers to bucket(s) {', '.join(unknown)}, which are "
+                    "not created; add them with --bucket"
+                )
+
+    def has_service(self, name: str) -> bool:
+        return name in self.services
+
+    @property
+    def effective_buckets(self) -> tuple[str, ...]:
+        if not self.has_service("s3"):
+            return ()
+        return self.buckets or (DEFAULT_BUCKET,)
 
     @property
     def node_count(self) -> int:
@@ -143,6 +240,11 @@ class ClusterSpec:
     def project_name(self) -> str:
         """Docker Compose project name; namespaces every container and volume."""
         return f"chlab-{self.name}"
+
+    @property
+    def network_name(self) -> str:
+        """Compose's default network for the project; every service resolves by hostname on it."""
+        return f"{self.project_name}_default"
 
     def with_ports(self, port_base: int) -> ClusterSpec:
         return replace(self, port_base=port_base)
@@ -166,6 +268,9 @@ class ClusterSpec:
         payload["users"] = tuple(construct(UserSpec, user) for user in payload.get("users") or ())
         payload["databases"] = tuple(
             construct(DatabaseSpec, database) for database in payload.get("databases") or ()
+        )
+        payload["s3_users"] = tuple(
+            construct(S3UserSpec, user) for user in payload.get("s3_users") or ()
         )
         return construct(cls, payload)
 
@@ -270,3 +375,20 @@ def parse_setting(text: str) -> tuple[str, str]:
     if not separator:
         raise SpecError(f"setting {text!r} must be written key=value")
     return validate_setting_key(key.strip()), value.strip()
+
+
+def parse_s3_user(text: str) -> S3UserSpec:
+    """Parse a ``--s3-user name:secret[:access[:bucket,bucket]]`` argument.
+
+    ``reader:readerpass:readonly:warehouse`` can read the ``warehouse`` bucket and nothing
+    else. Secrets cannot contain ``:``.
+    """
+    parts = text.split(":")
+    if len(parts) < 2 or len(parts) > 4:
+        raise SpecError(
+            f"could not parse S3 user {text!r}; expected name:secret[:access[:bucket,bucket]]"
+        )
+    name, secret = parts[0].strip(), parts[1]
+    access = parts[2].strip() if len(parts) > 2 and parts[2].strip() else "readwrite"
+    buckets = tuple(b.strip() for b in parts[3].split(",") if b.strip()) if len(parts) > 3 else ()
+    return S3UserSpec(name=name, secret=secret, access=access, buckets=buckets)

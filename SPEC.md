@@ -261,7 +261,7 @@ field, topology/compose/runtime treat them like keepers. No service is started u
 
 | Service | Image | Notes |
 |---|---|---|
-| `s3` | `rustfs/rustfs` | Matches clickhouse-regression's Iceberg suite. Path-style access only. Buckets created at start (`--bucket`, default `warehouse`). |
+| `s3` | `rustfs/rustfs:1.0.3` | Matches clickhouse-regression's Iceberg suite. Path-style access only. Buckets created at start (`--bucket`, default `warehouse`). |
 | `iceberg-rest` | `apache/iceberg-rest-fixture` | Backed by an SQLite *file*: the default in-memory store breaks under concurrent requests. |
 | `ice-rest` | `altinity/ice-rest-catalog` | Altinity's catalog; bearer-token auth. |
 | `spark` | `tabulario/spark-iceberg` | Opt-in and heavy (20–40s JVM start per call). Only for what pyiceberg cannot write: format v3, deletion vectors, merge-on-read deletes. |
@@ -310,13 +310,47 @@ expectation (an error code, an exact result, a result equal across builds).
 writes a JSON result plus a markdown transcript. No DSL: the files are what you would have
 typed anyway.
 
+### Decisions made for object storage
+
+**Services contribute; nothing branches on their names.** A service is a class in
+`chlab.core.services` providing its compose definition, `config.d` overlays for the nodes, a
+readiness probe, one-time setup, and its `chlab env` entry. Each gets a stride of ten host
+ports above the keeper range, which is why keepers are now capped at nine. An instance with no
+services keeps exactly the port span it had before, so the blocks of existing instances still
+describe what they reserved.
+
+**`mc` in a throwaway container, not an S3 client on the host.** Bucket and user setup and the
+`chlab s3` commands all run `mc` on the instance's network. It runs as the invoking user, so
+files it downloads into a mounted directory are not owned by root.
+
+**Named collections carry the root credentials.** `s3(s3, filename = 'x')` is short enough to
+type in every reproduction. Using a collection needs `NAMED COLLECTION ON <name>`; `default`
+has `named_collection_control`, and chlab's `admin` role passes on `CURRENT GRANTS`, but the
+`readwrite` and `readonly` roles deliberately get nothing on S3. Reproductions about access
+control need that boundary exactly where the grants put it.
+
+**Scoped identities are real policies.** `--s3-user reader:pw:readonly:warehouse` becomes a
+RustFS user with a policy on `arn:aws:s3:::warehouse` and `.../*`. Verified: that identity
+reads `warehouse`, is refused listing `other`, and is refused writes. Secrets are checked to
+be at least eight characters, because RustFS otherwise fails setup with "invalid secret key
+length" long after the command that asked for it.
+
+**ProfileEvents are summed by `initial_query_id` across the cluster.** `s3Cluster` and
+`Distributed` queries do part of their work on other nodes; asking only the node that
+received the query undercounts. Verified on a two-node `s3Cluster` read: 2 GETs on one node,
+1 on the other, 3 reported. Every node's log is flushed first. Bare binaries now get a
+`query_log` in their generated config; stock images already have one.
+
+**Caches change counts.** Antalya builds answer `count()` over Parquet from cached footers,
+so a repeated `count()` can show zero GETs. A reproduction about request counts should read
+data and set `enable_filesystem_cache = 0`, or compare cold runs.
+
 ### Phases
 
-1. **Interaction primitives** on what exists: `exec`, `cp`, `restart`, `query --file` and
-   `--setting`, query/profile-level settings at launch, server error codes in output and
-   JSON, `env --json`.
-2. **Object storage:** the service framework, `s3` with buckets and extra credentials, the
-   `chlab s3` commands, named collections, a ProfileEvents helper for a query.
+1. **Interaction primitives** — done. `exec`, `cp`, `restart`, `query --file` and
+   `--setting`, `up --query-setting`, server error codes in output and JSON, `env --json`.
+2. **Object storage** — done. The service framework, `s3` with buckets and scoped
+   identities, the `chlab s3` commands, named collections, `query --events`.
 3. **Iceberg:** catalog-less (`icebergS3`, `IcebergLocal`), `iceberg-rest`, `ice-rest`, the
    tools image and `chlab py`.
 4. **Reproduction files:** `chlab repro run`, with `--compare`.

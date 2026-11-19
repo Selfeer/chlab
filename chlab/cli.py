@@ -31,10 +31,12 @@ from .core.registry import Registry
 from .core.resolve import Resolved, resolve
 from .core.runtime import InstanceStatus, Runtime
 from .core.spec import (
+    DEFAULT_BUCKET,
     ClusterSpec,
     SpecError,
     parse_database,
     parse_grant,
+    parse_s3_user,
     parse_setting,
     parse_user,
     suggest_name,
@@ -46,9 +48,15 @@ app = typer.Typer(
     add_completion=False,
 )
 cache_app = typer.Typer(help="Inspect and clear the artifact cache.", no_args_is_help=True)
+s3_app = typer.Typer(
+    help="Work with an instance's s3 service (started with --with s3). Paths are "
+    "BUCKET/KEY. Every command runs mc in a throwaway container and exits with its code.",
+    no_args_is_help=True,
+)
 profiles_app = typer.Typer(help="Saved cluster topologies.", no_args_is_help=True)
 app.add_typer(cache_app, name="cache")
 app.add_typer(profiles_app, name="profiles")
+app.add_typer(s3_app, name="s3")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -249,6 +257,30 @@ def up_command(
             "key=value — e.g. allow_insert_into_iceberg=1. Repeatable.",
         ),
     ] = None,
+    with_service: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--with",
+            "-w",
+            help="Start a companion service next to the cluster: s3 (RustFS object storage). "
+            "Repeatable.",
+        ),
+    ] = None,
+    bucket: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--bucket",
+            help=f"Bucket to create in the s3 service (default: {DEFAULT_BUCKET}). Repeatable.",
+        ),
+    ] = None,
+    s3_user: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--s3-user",
+            help="Extra S3 identity: name:secret[:readwrite|readonly|writeonly[:bucket,bucket]]. "
+            "Secrets need 8+ characters. Repeatable.",
+        ),
+    ] = None,
     seed: Annotated[
         bool | None,
         typer.Option(
@@ -295,6 +327,12 @@ def up_command(
             overrides["settings"] = dict(parse_setting(text) for text in setting)
         if query_setting:
             overrides["profile_settings"] = dict(parse_setting(text) for text in query_setting)
+        if with_service:
+            overrides["services"] = tuple(dict.fromkeys(with_service))
+        if bucket:
+            overrides["buckets"] = tuple(bucket)
+        if s3_user:
+            overrides["s3_users"] = tuple(parse_s3_user(text) for text in s3_user)
 
         base = profiles_module.Profiles.default().get(profile) if profile else {}
         fields = profiles_module.apply(base, overrides)
@@ -452,6 +490,17 @@ def query_command(
         str | None,
         typer.Option("--format", help="With --file: the client's output format, e.g. TSV."),
     ] = None,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            "-e",
+            metavar="REGEX",
+            help="Also report the query's ProfileEvents whose names match REGEX, summed over "
+            "every node that took part — e.g. 'S3GetObject|ReadBufferFromS3Bytes'. "
+            "'.' shows all.",
+        ),
+    ] = None,
     json: JsonOption = False,
 ) -> None:
     """Run SQL against an instance.
@@ -470,6 +519,8 @@ def query_command(
     if file is not None:
         if json:
             _fail(SpecError("--json is not supported with --file; use --format JSONEachRow"))
+        if events is not None:
+            _fail(SpecError("--events is not supported with --file; run the statement alone"))
         _run_sql_file(
             runtime,
             name,
@@ -485,6 +536,10 @@ def query_command(
         return
 
     options = {"user": user, "password": password, "database": database, "settings": settings}
+    if events is not None:
+        import uuid
+
+        options["query_id"] = f"chlab-{uuid.uuid4()}"
     try:
         if all_nodes:
             results = runtime.query_all(name, sql, **options)
@@ -493,6 +548,10 @@ def query_command(
                 results = [runtime.query(name, sql, node=node, **options)]
             except QueryError as failure:
                 results = [failure]
+        if events is not None:
+            for result in results:
+                if result.query_id:
+                    result.events = runtime.profile_events(name, result.query_id, events)
     except ChlabError as failure:
         _fail(failure)
 
@@ -505,10 +564,12 @@ def query_command(
         if isinstance(result, QueryError):
             label = f"{result.node}: " if result.node else ""
             error_console.print(f"[bold red]{escape(label)}error:[/bold red] {escape(str(result))}")
-            continue
-        if all_nodes:
-            console.print(f"[bold]{result.node}[/bold]")
-        _print_result(result)
+        else:
+            if all_nodes:
+                console.print(f"[bold]{result.node}[/bold]")
+            _print_result(result)
+        if result.events is not None:
+            _print_events(result.events)
 
     if all_nodes:
         console.print(_agreement_line(results))
@@ -700,6 +761,159 @@ def env_command(name: NameArgument, json: JsonOption = False) -> None:
     console.print(users)
 
 
+# --- s3 ----------------------------------------------------------------------------------
+
+AsUserOption = Annotated[
+    str | None,
+    typer.Option("--as", help="Act as this S3 user (from --s3-user) instead of the root user."),
+]
+
+
+def _s3_spec(name: str) -> ClusterSpec:
+    spec = Registry().load(name)
+    if not spec.has_service("s3"):
+        raise SpecError(f"{name} has no s3 service; launch it with --with s3")
+    return spec
+
+
+def _run_mc(name: str, args: list[str], *, as_user=None, mounts=(), stdin=False) -> NoReturn:
+    import subprocess
+
+    from .core.services import s3
+
+    try:
+        command = s3.mc_command(
+            _s3_spec(name), args, as_user=as_user, mounts=mounts, interactive=stdin
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(command))
+
+
+@s3_app.command("ls")
+def s3_ls(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET[/PREFIX]. Omit for all buckets.")] = "",
+    recursive: Annotated[bool, typer.Option("--recursive", "-r")] = False,
+    json: Annotated[bool, typer.Option("--json", help="mc's JSON lines output.")] = False,
+    as_user: AsUserOption = None,
+) -> None:
+    """List buckets or objects."""
+    from .core.services.s3 import object_path
+
+    args = ["ls", *(["--recursive"] if recursive else []), *(["--json"] if json else [])]
+    _run_mc(name, [*args, object_path(path)], as_user=as_user)
+
+
+@s3_app.command("put")
+def s3_put(
+    name: NameArgument,
+    paths: Annotated[
+        list[str], typer.Argument(help="Local files or directories, then BUCKET/KEY last.")
+    ],
+    as_user: AsUserOption = None,
+) -> None:
+    """Upload files or directories: `chlab s3 put lab ./a.parquet ./dir warehouse/data/`.
+
+    As with cp, a destination ending in / is a prefix to copy into.
+    """
+    from .core.services.s3 import object_path
+
+    if len(paths) < 2:
+        _fail(SpecError("give at least one local path and a BUCKET/KEY destination"))
+    *sources, destination = paths
+    mounts, inside = [], []
+    for index, source in enumerate(sources):
+        local = Path(source).expanduser()
+        if not local.exists():
+            _fail(SpecError(f"{source} does not exist"))
+        target = f"/chlab-in/{index}/{local.resolve().name}"
+        mounts.append((str(local.resolve()), target, True))
+        inside.append(target)
+    _run_mc(
+        name,
+        ["cp", "--recursive", *inside, object_path(destination)],
+        as_user=as_user,
+        mounts=mounts,
+    )
+
+
+@s3_app.command("get")
+def s3_get(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY or BUCKET/PREFIX/.")],
+    destination: Annotated[str, typer.Argument(help="Local file or existing directory.")] = ".",
+    as_user: AsUserOption = None,
+) -> None:
+    """Download an object, or a prefix recursively."""
+    from .core.services.s3 import object_path
+
+    local = Path(destination).expanduser().resolve()
+    if local.is_dir():
+        mount, target = local, "/chlab-out/"
+    else:
+        if not local.parent.is_dir():
+            _fail(SpecError(f"{local.parent} does not exist"))
+        mount, target = local.parent, f"/chlab-out/{local.name}"
+    _run_mc(
+        name,
+        ["cp", "--recursive", object_path(path), target],
+        as_user=as_user,
+        mounts=[(str(mount), "/chlab-out", False)],
+    )
+
+
+@s3_app.command("cat")
+def s3_cat(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Print an object, e.g. an Iceberg metadata.json."""
+    from .core.services.s3 import object_path
+
+    _run_mc(name, ["cat", object_path(path)], as_user=as_user)
+
+
+@s3_app.command("rm")
+def s3_rm(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY, or a prefix with --recursive.")],
+    recursive: Annotated[bool, typer.Option("--recursive", "-r")] = False,
+    as_user: AsUserOption = None,
+) -> None:
+    """Delete an object, or everything under a prefix."""
+    from .core.services.s3 import object_path
+
+    args = ["rm", *(["--recursive", "--force"] if recursive else []), object_path(path)]
+    _run_mc(name, args, as_user=as_user)
+
+
+@s3_app.command("mb")
+def s3_mb(
+    name: NameArgument,
+    bucket: Annotated[str, typer.Argument(help="Bucket to create.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Create a bucket after launch (or use --bucket at `chlab up`)."""
+    from .core.services.s3 import object_path
+
+    _run_mc(name, ["mb", "--ignore-existing", object_path(bucket)], as_user=as_user)
+
+
+@s3_app.command("mc")
+def s3_mc(
+    name: NameArgument,
+    args: Annotated[list[str], typer.Argument(help="mc arguments, after `--`. The alias is `s3`.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Run any mc command against the instance: `chlab s3 mc lab -- stat s3/warehouse/x`.
+
+    Stdin is passed through, so `... -- pipe s3/warehouse/key < file` works.
+    """
+    _run_mc(name, list(args), as_user=as_user, stdin=True)
+
+
 # --- profiles ----------------------------------------------------------------------------
 
 
@@ -868,6 +1082,8 @@ def _print_instance(status: InstanceStatus) -> None:
         )
     for keeper in status.topology.keepers:
         table.add_row(keeper.name, "-", "-", f"127.0.0.1:{keeper.client_port}", "-", "-")
+    for service in status.topology.services:
+        table.add_row(service.name, "-", "-", f"http://127.0.0.1:{service.port_base}", "-", "-")
     console.print(table)
 
 
@@ -885,6 +1101,18 @@ def _print_result(result: QueryResult) -> None:
     console.print(
         f"[dim]{len(result.rows)} row(s), {result.rows_read} read in {result.elapsed:.3f}s[/dim]"
     )
+
+
+def _print_events(events: dict[str, int]) -> None:
+    if not events:
+        console.print("[dim]no matching ProfileEvents[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    table.add_column("EVENT", style="bold")
+    table.add_column("VALUE", justify="right")
+    for event, value in events.items():
+        table.add_row(event, str(value))
+    console.print(table)
 
 
 def _agreement_line(results: list) -> str:
@@ -907,6 +1135,8 @@ def _topology_summary(status: InstanceStatus) -> str:
     summary = f"{spec.shards}x{spec.replicas} ({spec.node_count} node{'s' if spec.node_count > 1 else ''})"
     if status.topology.keepers:
         summary += f" + {len(status.topology.keepers)} keeper"
+    for service in status.topology.services:
+        summary += f" + {service.name}"
     return summary
 
 
@@ -1023,15 +1253,21 @@ def _status_as_dict(status: InstanceStatus) -> dict:
 
 def _result_as_dict(result) -> dict:
     if isinstance(result, QueryError):
-        return {"node": result.node, "error": str(result), "code": result.code}
-    return {
-        "node": result.node,
-        "columns": result.columns,
-        "types": result.types,
-        "rows": result.rows,
-        "rows_read": result.rows_read,
-        "elapsed": result.elapsed,
-    }
+        payload = {"node": result.node, "error": str(result), "code": result.code}
+    else:
+        payload = {
+            "node": result.node,
+            "columns": result.columns,
+            "types": result.types,
+            "rows": result.rows,
+            "rows_read": result.rows_read,
+            "elapsed": result.elapsed,
+        }
+    if result.query_id:
+        payload["query_id"] = result.query_id
+    if result.events is not None:
+        payload["events"] = result.events
+    return payload
 
 
 def _fail(failure: Exception) -> NoReturn:

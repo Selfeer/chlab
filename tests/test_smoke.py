@@ -68,3 +68,46 @@ def test_launch_query_and_tear_down(runtime: Runtime):
         assert as_reader.rows == [["reader"]]
     finally:
         runtime.destroy("smoke")
+
+
+def test_s3_service_round_trip(runtime: Runtime):
+    """Object storage, named collections, request counts and a scoped identity, end to end."""
+    from chlab.core.query import QueryError
+    from chlab.core.spec import S3UserSpec
+
+    spec = ClusterSpec(
+        name="smoke-s3",
+        source=IMAGE,
+        services=("s3",),
+        buckets=("warehouse", "other"),
+        s3_users=(S3UserSpec("reader", "readerpass", "readonly", ("warehouse",)),),
+    )
+    try:
+        runtime.up(spec)
+        runtime.query(
+            "smoke-s3",
+            "INSERT INTO FUNCTION s3(s3, filename = 'd.parquet') SELECT number FROM numbers(1000)",
+        )
+        result = runtime.query(
+            "smoke-s3", "SELECT sum(number) FROM s3(s3, filename = 'd.parquet')", query_id="smoke-q"
+        )
+        assert int(result.rows[0][0]) == 499500
+        assert runtime.profile_events("smoke-s3", "smoke-q", "^S3GetObject$")["S3GetObject"] > 0
+
+        url = "http://s3:9000/{}/d.parquet"
+        readable = runtime.query(
+            "smoke-s3",
+            f"SELECT count() FROM s3('{url.format('warehouse')}', 'reader', 'readerpass')",
+        )
+        assert int(readable.rows[0][0]) == 1000
+        runtime.query(
+            "smoke-s3", "INSERT INTO FUNCTION s3(s3_other, filename='d.parquet') SELECT 1"
+        )
+        with pytest.raises(QueryError) as denied:
+            runtime.query(
+                "smoke-s3",
+                f"SELECT count() FROM s3('{url.format('other')}', 'reader', 'readerpass')",
+            )
+        assert denied.value.code == 499  # S3_ERROR: the storage refused the scoped identity
+    finally:
+        runtime.destroy("smoke-s3")

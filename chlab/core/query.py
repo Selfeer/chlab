@@ -36,6 +36,8 @@ class QueryError(ChlabError):
         super().__init__(message)
         self.node = node
         self.code = code if code is not None else error_code(message)
+        self.query_id: str | None = None
+        self.events: dict[str, int] | None = None
 
 
 def error_code(message: str) -> int | None:
@@ -53,6 +55,9 @@ class QueryResult:
     elapsed: float = 0.0
     #: Set when the result came from a fan-out across nodes.
     node: str | None = None
+    query_id: str | None = None
+    #: ProfileEvents of the query, summed over every node that took part, when requested.
+    events: dict[str, int] | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -69,11 +74,14 @@ def execute(
     settings: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     node: str | None = None,
+    query_id: str | None = None,
 ) -> QueryResult:
     """Run ``sql`` against a node's HTTP port and return its result."""
     params: dict[str, str] = {"default_format": DEFAULT_FORMAT}
     if database:
         params["database"] = database
+    if query_id:
+        params["query_id"] = query_id
     params.update(settings or {})
 
     request = urllib.request.Request(

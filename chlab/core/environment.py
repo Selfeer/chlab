@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import services as companions
 from .registry import Registry
 from .runtime import InstanceStatus
 from .topology import (
@@ -28,9 +29,8 @@ def describe(status: InstanceStatus, registry: Registry) -> dict[str, Any]:
         "source": spec.source,
         "cluster": spec.cluster_name,
         "compose_project": spec.project_name,
-        # Compose names a project's default network <project>_default; anything attached to
-        # it resolves the services below by their hostnames.
-        "network": f"{spec.project_name}_default",
+        # Anything attached to this network resolves the services below by their hostnames.
+        "network": spec.network_name,
         "directory": str(registry.instance_dir(spec.name)),
         "nodes": [
             {
@@ -69,6 +69,10 @@ def describe(status: InstanceStatus, registry: Registry) -> dict[str, Any]:
         "databases": [
             {"name": database.name, "engine": database.engine} for database in spec.databases
         ],
+        "services": {
+            service.name: service.describe(topology, endpoint)
+            for service, endpoint in companions.active(topology)
+        },
         "settings": {"server": dict(spec.settings), "profile": dict(spec.profile_settings)},
         "seed": spec.seed,
     }
