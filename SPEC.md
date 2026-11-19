@@ -29,8 +29,11 @@ chlab ui        # setup wizard + SQL editor at localhost:7777
 
 ## Non-goals (v1)
 
-TLS, S3/MinIO, Kafka, LDAP/Kerberos, RPM packages, ZooKeeper (Keeper only), sanitizer
+TLS, Kafka, LDAP/Kerberos, RPM packages, ZooKeeper (Keeper only), sanitizer
 detection, cross-architecture execution. All additive later; none change the core shape.
+
+S3-compatible storage and Iceberg were non-goals in v1; they are now in scope — see
+*Reproduction toolkit* below.
 
 ---
 
@@ -206,6 +209,119 @@ rebinding: a page the user visits can point a hostname it controls at `127.0.0.1
 API same-origin. The API runs SQL and deletes clusters, so it answers only on loopback names.
 The SQL editor's Ace build is vendored rather than loaded from a CDN, which also makes the UI
 work offline.
+
+## Reproduction toolkit
+
+**Status: in progress.**
+
+### Purpose
+
+PR audit reviews of ClickHouse report defects in prose: *"a plain `OPTIMIZE TABLE` still
+records the new metadata file"*, *"a plain column's bloom read downloads the previous column's
+fallback body"*. Someone then has to decide whether each finding is real. chlab's job is to
+make that cheap: everything a finding needs to be reproduced — the build, object storage, an
+Iceberg catalog, the right settings, a way to look inside the containers — is one command
+away, and a reproduction can be written down and replayed by someone else.
+
+chlab is the toolbox, not the investigator. It does not read reviews, fetch PR builds or
+decide verdicts; whoever drives it (a developer, or any agent pointed at `chlab --help`)
+does. That sets the bar for the interface: every capability is a plain, discoverable
+command; every command that reports something has `--json`; failures exit non-zero with the
+server's own error code; nothing requires an interactive terminal.
+
+### What reproductions actually need
+
+Taken from three audited PRs (Altinity/ClickHouse #2588, #2792, #2551):
+
+| Need | Example |
+|---|---|
+| object storage with files in it | Parquet files with particular bloom-filter layouts, read over S3 |
+| request-level evidence | count of S3 GETs per query, from `ProfileEvents` and `query_log` |
+| an Iceberg catalog | `CREATE TABLE ... AS` from a `DataLakeCatalog` table |
+| catalog-less Iceberg | `IcebergLocal`, `icebergS3` over a path |
+| files inside the server | read `metadata/v4.metadata.json` with `jq` after an `OPTIMIZE` |
+| restarts | "engine settings are lost when the table is reopened" |
+| query/profile settings | `allow_insert_into_iceberg`, `allow_experimental_iceberg_compaction` |
+| several buckets and credentials | cross-bucket external paths, restricted access |
+| the same steps on two builds | "is this new in the PR, or already on the base branch?" |
+
+### Shape
+
+**Companion services** are add-ons to an instance's compose project, chosen with
+`--with`:
+
+```bash
+chlab up -c <build> --name lab --with s3 --with iceberg-rest
+```
+
+Each service is a small module that contributes: a compose fragment, a readiness check, the
+ClickHouse configuration it needs (named collections, `remote_url_allow_hosts`), and its
+entry in `chlab env`. They join the existing pipeline — `ClusterSpec` gains a `services`
+field, topology/compose/runtime treat them like keepers. No service is started unless asked.
+
+| Service | Image | Notes |
+|---|---|---|
+| `s3` | `rustfs/rustfs` | Matches clickhouse-regression's Iceberg suite. Path-style access only. Buckets created at start (`--bucket`, default `warehouse`). |
+| `iceberg-rest` | `apache/iceberg-rest-fixture` | Backed by an SQLite *file*: the default in-memory store breaks under concurrent requests. |
+| `ice-rest` | `altinity/ice-rest-catalog` | Altinity's catalog; bearer-token auth. |
+| `spark` | `tabulario/spark-iceberg` | Opt-in and heavy (20–40s JVM start per call). Only for what pyiceberg cannot write: format v3, deletion vectors, merge-on-read deletes. |
+| later | toxiproxy, Azurite, Kafka | Latency/fault injection in front of S3 first. |
+
+Glue is TBD: the only local option, LocalStack Pro, needs a paid token. Nessie, Polaris,
+Hive and Unity have no prior art in clickhouse-regression and are not planned.
+
+**A tools container, not host dependencies.** Writing Iceberg data needs pyiceberg and
+pyarrow; inspecting buckets needs an S3 client. These live in one `chlab/tools` image, built
+once like `chlab/base`, attached to the instance's network with the catalog and S3
+endpoints already in its environment. chlab itself stays dependency-light, and a script that
+works for one person works for everyone.
+
+```bash
+chlab s3 put lab ./data.parquet warehouse/data/   # also ls, cat, rm, mb
+chlab py lab make_table.py                        # pyiceberg, wired to the instance
+```
+
+**ClickHouse sees the services by name.** Every node gets named collections for what is
+running (`s3`, `iceberg_rest`), so SQL stays short — `icebergS3(s3, filename = 'data')` — and
+`default` is granted what it needs to use them. (`SHOW NAMED COLLECTIONS SECRETS` is the
+grant a CI run already tripped over.)
+
+**`chlab env`** prints everything a person or script needs to talk to an instance:
+endpoints from the host and from inside the network, credentials, container names, and
+ready-to-paste SQL for each service, version-gated where ClickHouse changed its syntax
+(`DataLakeCatalog` from 25.3, `Iceberg` before; `icebergS3` from 24.9).
+
+### Reproductions as files
+
+A reproduction is a directory a reviewer can hand to a developer:
+
+```
+repro/2792-binpack/
+  repro.yaml        topology, services, settings, buckets
+  01-setup.sql
+  02-optimize.sql
+  03-check.sh       runs inside a node via `chlab exec`
+  04-data.py        runs in the tools container
+```
+
+Steps are plain `.sql`, `.sh` and `.py` files run in name order, each with an optional
+expectation (an error code, an exact result, a result equal across builds).
+`chlab repro run <dir> -c <build> [--compare <other build>]` runs them on fresh instances and
+writes a JSON result plus a markdown transcript. No DSL: the files are what you would have
+typed anyway.
+
+### Phases
+
+1. **Interaction primitives** on what exists: `exec`, `cp`, `restart`, `query --file` and
+   `--setting`, query/profile-level settings at launch, server error codes in output and
+   JSON, `env --json`.
+2. **Object storage:** the service framework, `s3` with buckets and extra credentials, the
+   `chlab s3` commands, named collections, a ProfileEvents helper for a query.
+3. **Iceberg:** catalog-less (`icebergS3`, `IcebergLocal`), `iceberg-rest`, `ice-rest`, the
+   tools image and `chlab py`.
+4. **Reproduction files:** `chlab repro run`, with `--compare`.
+5. **On demand:** `spark`, toxiproxy, Azurite, cluster-function setups for `s3Cluster` /
+   `icebergS3Cluster`.
 
 ## Possible next steps
 

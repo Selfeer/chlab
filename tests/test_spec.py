@@ -170,3 +170,16 @@ def test_every_chlab_exception_inherits_the_base_class():
             if issubclass(obj, BaseException) and not issubclass(obj, ChlabError):
                 stray.append(f"{module.__name__}.{name}")
     assert stray == [], f"these exceptions do not inherit ChlabError: {stray}"
+
+
+def test_profile_settings_round_trip_and_are_copied():
+    source = {"allow_insert_into_iceberg": "1"}
+    spec = ClusterSpec(name="t", source="/x", profile_settings=source)
+    source["max_threads"] = "1"
+    assert spec.profile_settings == {"allow_insert_into_iceberg": "1"}
+    assert ClusterSpec.from_dict(spec.to_dict()).profile_settings == spec.profile_settings
+
+
+def test_profile_setting_keys_are_validated():
+    with pytest.raises(SpecError, match="invalid setting name"):
+        ClusterSpec(name="t", source="/x", profile_settings={"max threads": "1"})

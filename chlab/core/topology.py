@@ -79,6 +79,26 @@ class Topology:
     def node_names(self) -> tuple[str, ...]:
         return tuple(node.name for node in self.nodes)
 
+    @property
+    def service_names(self) -> tuple[str, ...]:
+        """Every compose service of the instance: ClickHouse nodes, then keepers."""
+        return (*self.node_names, *(keeper.name for keeper in self.keepers))
+
+    def service(self, name: str | None) -> str:
+        """Validate a service name, defaulting to the first ClickHouse node."""
+        if name is None:
+            return self.nodes[0].name
+        if name not in self.service_names:
+            raise UnknownNode(
+                f"{name!r} is not a service of {self.spec.name}; "
+                f"expected one of {', '.join(self.service_names)}"
+            )
+        return name
+
+    def container(self, service: str | None = None) -> str:
+        """Docker container name of a service."""
+        return f"{self.spec.project_name}-{self.service(service)}"
+
     def shard_layout(self) -> list[list[Node]]:
         """Nodes grouped by shard, in shard order."""
         return [

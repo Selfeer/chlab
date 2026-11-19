@@ -54,6 +54,7 @@ class CreatePayload(BaseModel):
     users: list[UserPayload] = Field(default_factory=list)
     databases: list[DatabasePayload] = Field(default_factory=list)
     settings: dict[str, str] = Field(default_factory=dict)
+    profile_settings: dict[str, str] = Field(default_factory=dict)
     seed: bool = False
     save_as_profile: str | None = None
 
@@ -155,6 +156,7 @@ def create_app(
                     if database.name.strip()
                 ),
                 settings=payload.settings,
+                profile_settings=payload.profile_settings,
                 seed=payload.seed,
             )
         except SpecError as failure:
@@ -293,7 +295,7 @@ def _status_dict(status: InstanceStatus) -> dict[str, Any]:
 
 def _result_dict(result: QueryResult | QueryError, *, limit: int | None = None) -> dict[str, Any]:
     if isinstance(result, QueryError):
-        return {"node": result.node, "error": str(result)}
+        return {"node": result.node, "error": str(result), "code": result.code}
     rows = result.rows if limit is None else result.rows[:limit]
     return {
         "node": result.node,

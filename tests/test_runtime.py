@@ -120,3 +120,80 @@ def test_recreate_allocates_ports_when_the_old_spec_is_unreadable(tmp_path: Path
 
     spec = instance._inherit_ports(ClusterSpec(name="lab", source="/x"), lambda _m: None)
     assert spec.port_base is None  # falls through to a fresh allocation rather than raising
+
+
+def test_restart_targets_only_the_named_services(runtime):
+    instance, calls = runtime
+    instance.restart("lab", ["clickhouse2"])
+    assert calls == [("restart", "clickhouse2")]
+
+
+def test_restart_without_services_restarts_everything(runtime):
+    instance, calls = runtime
+    instance.restart("lab")
+    assert calls == [("restart",)]
+
+
+def test_restart_rejects_unknown_services(runtime):
+    from chlab.core.topology import UnknownNode
+
+    instance, calls = runtime
+    with pytest.raises(UnknownNode, match="clickhouse9"):
+        instance.restart("lab", ["clickhouse9"])
+    assert calls == []
+
+
+def test_exec_command_runs_in_the_named_container(runtime):
+    instance, _ = runtime
+    command = instance.exec_command("lab", ["jq", "."], service="clickhouse3", interactive=True)
+    assert command == ["docker", "exec", "-i", "chlab-lab-clickhouse3", "jq", "."]
+
+
+def test_exec_can_target_a_keeper(tmp_path: Path):
+    instance = Runtime(registry=Registry(tmp_path / "state"))
+    instance.registry.save(ClusterSpec(name="lab", source="/x", replicas=2, port_base=21000))
+    assert instance.exec_command("lab", ["true"], service="keeper1")[2] == "chlab-lab-keeper1"
+
+
+def test_copy_command_goes_both_ways(runtime):
+    instance, _ = runtime
+    into = instance.copy_command(
+        "lab", service=None, container_path="/tmp/x", host_path="./x", to_container=True
+    )
+    out = instance.copy_command(
+        "lab", service="clickhouse2", container_path="/tmp/x", host_path="./x", to_container=False
+    )
+    assert into == ["docker", "cp", "./x", "chlab-lab-clickhouse1:/tmp/x"]
+    assert out == ["docker", "cp", "chlab-lab-clickhouse2:/tmp/x", "./x"]
+
+
+def test_client_script_command_runs_multiquery_with_settings(runtime):
+    instance, _ = runtime
+    command = instance.client_script_command(
+        "lab",
+        node="clickhouse2",
+        user="dev",
+        password="pw",
+        settings={"allow_insert_into_iceberg": "1"},
+        output_format="TSV",
+    )
+    assert command[:4] == ["docker", "exec", "-i", "chlab-lab-clickhouse2"]
+    assert "--multiquery" in command
+    assert command[command.index("--user") + 1] == "dev"
+    assert command[command.index("--password") + 1] == "pw"
+    assert command[command.index("--format") + 1] == "TSV"
+    assert "--allow_insert_into_iceberg=1" in command
+
+
+def test_environment_reports_host_and_network_endpoints(runtime):
+    from chlab.core.environment import describe
+
+    instance, _ = runtime
+    info = describe(instance.status("lab"), instance.registry)
+    first = info["nodes"][0]
+    assert first["container"] == "chlab-lab-clickhouse1"
+    assert first["host"]["http"] == "http://127.0.0.1:21000"
+    assert first["network"]["http"] == "http://clickhouse1:8123"
+    assert info["network"] == "chlab-lab_default"
+    assert info["keepers"][0]["network"] == "keeper1:9181"
+    assert info["users"][0]["name"] == "default"

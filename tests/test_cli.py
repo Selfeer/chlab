@@ -274,3 +274,164 @@ def test_cache_rm_reports_a_miss():
     result = invoke("cache", "rm", "24.8")
     assert result.exit_code == 1
     assert "nothing cached matches" in result.output
+
+
+# --- reproduction primitives -------------------------------------------------------------
+
+
+def test_query_settings_at_launch_go_into_the_profile(monkeypatch):
+    seen = captured_spec(monkeypatch)
+    result = invoke("up", "-c", "/x", "-n", "lab", "--query-setting", "allow_insert_into_iceberg=1")
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].profile_settings == {"allow_insert_into_iceberg": "1"}
+    assert seen["spec"].settings == {}
+
+
+def test_query_failure_reports_the_error_code_as_json_and_exits_1(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        raise QueryError("Code: 60. DB::Exception: Unknown table", node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    result = invoke("query", "lab", "SELECT * FROM nope", "--json")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == [
+        {"node": "clickhouse1", "error": "Code: 60. DB::Exception: Unknown table", "code": 60}
+    ]
+
+
+def test_query_passes_settings_through(saved_instance, monkeypatch):
+    from chlab.core.query import QueryResult
+
+    seen = {}
+
+    def capture(self, name, sql, **kwargs):
+        seen.update(kwargs)
+        return QueryResult(node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", capture)
+    result = invoke("query", "lab", "SELECT 1", "-s", "max_threads=1", "--setting", "a.b=2")
+    assert result.exit_code == 0, result.output
+    assert seen["settings"] == {"max_threads": "1", "a.b": "2"}
+
+
+def test_fan_out_exits_1_when_any_node_fails(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError, QueryResult
+
+    monkeypatch.setattr(
+        Runtime,
+        "query_all",
+        lambda self, name, sql, **kw: [
+            QueryResult(columns=["x"], rows=[[1]], node="clickhouse1"),
+            QueryError("Code: 497. ACCESS_DENIED", node="clickhouse2"),
+        ],
+    )
+    result = invoke("query", "lab", "SELECT 1", "--all")
+    assert result.exit_code == 1
+
+
+def test_server_errors_with_brackets_are_printed_verbatim(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        raise QueryError("Code: 47. Unknown identifier [bold]x[/bold]", node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    result = invoke("query", "lab", "SELECT x")
+    assert "[bold]x[/bold]" in result.output
+
+
+@pytest.mark.parametrize("args", [[], ["SELECT 1", "--file", "x.sql"]])
+def test_query_needs_exactly_one_of_sql_or_file(saved_instance, args):
+    result = invoke("query", "lab", *args)
+    assert result.exit_code == 1
+    assert "exactly one" in result.output
+
+
+def test_query_file_runs_through_the_client_on_every_node(saved_instance, monkeypatch, tmp_path):
+    script = tmp_path / "steps.sql"
+    script.write_text("SELECT 1; SELECT 2;")
+    runs = []
+
+    class Done:
+        returncode = 0
+
+    def fake_run(command, input, text):
+        runs.append((command, input))
+        return Done()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = invoke("query", "lab", "--file", str(script), "--all")
+    assert result.exit_code == 0, result.output
+    assert [command[3] for command, _ in runs] == ["chlab-lab-clickhouse1", "chlab-lab-clickhouse2"]
+    assert all(stdin == "SELECT 1; SELECT 2;" for _, stdin in runs)
+
+
+def test_query_file_propagates_the_client_exit_code(saved_instance, monkeypatch, tmp_path):
+    script = tmp_path / "steps.sql"
+    script.write_text("SELEKT 1")
+
+    class Failed:
+        returncode = 62
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: Failed())
+    assert invoke("query", "lab", "-f", str(script)).exit_code == 62
+
+
+def test_exec_returns_the_command_exit_code(saved_instance, monkeypatch):
+    seen = {}
+
+    def fake_call(command):
+        seen["command"] = command
+        return 3
+
+    monkeypatch.setattr("subprocess.call", fake_call)
+    result = invoke("exec", "lab", "--node", "clickhouse2", "--", "ls", "-la", "/")
+    assert result.exit_code == 3
+    assert seen["command"][-4:] == ["chlab-lab-clickhouse2", "ls", "-la", "/"]
+
+
+def test_exec_reports_an_unknown_node(saved_instance):
+    result = invoke("exec", "lab", "--node", "clickhouse9", "--", "true")
+    assert result.exit_code == 1
+    assert "clickhouse9" in result.output
+
+
+@pytest.mark.parametrize(
+    "source, destination, expected",
+    [
+        ("./x.parquet", "lab:/tmp/", ["./x.parquet", "chlab-lab-clickhouse1:/tmp/"]),
+        ("lab/clickhouse2:/tmp/x", "./x", ["chlab-lab-clickhouse2:/tmp/x", "./x"]),
+    ],
+)
+def test_cp_maps_instance_paths_to_containers(
+    saved_instance, monkeypatch, source, destination, expected
+):
+    seen = {}
+    monkeypatch.setattr("subprocess.call", lambda command: seen.setdefault("c", command) and 0)
+    result = invoke("cp", source, destination)
+    assert result.exit_code == 0, result.output
+    assert seen["c"] == ["docker", "cp", *expected]
+
+
+@pytest.mark.parametrize(
+    "source, destination", [("./a", "./b"), ("lab:/a", "lab:/b"), ("nope:/a", "./b")]
+)
+def test_cp_needs_exactly_one_instance_side(saved_instance, source, destination):
+    assert invoke("cp", source, destination).exit_code == 1
+
+
+def test_env_json_describes_how_to_reach_the_instance(saved_instance):
+    result = invoke("env", "lab", "--json")
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.stdout)
+    assert [node["container"] for node in info["nodes"]] == [
+        "chlab-lab-clickhouse1",
+        "chlab-lab-clickhouse2",
+    ]
+    assert info["network"] == "chlab-lab_default"
+
+
+def test_env_reports_an_unknown_instance():
+    assert invoke("env", "nope").exit_code == 1

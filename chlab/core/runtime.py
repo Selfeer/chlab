@@ -176,6 +176,23 @@ class Runtime:
         self._wait_healthy(build_topology(spec), notify=notify)
         return self.status(name)
 
+    def restart(
+        self, name: str, services: Iterable[str] = (), *, on_event: EventCallback | None = None
+    ) -> InstanceStatus:
+        """Restart some or all services, then wait until the cluster is usable again.
+
+        A restart is how a reproduction checks what survives a table being reopened, so this
+        waits for the full readiness sequence rather than returning while servers boot.
+        """
+        notify = on_event or (lambda _message: None)
+        spec = self.registry.load(name)
+        topology = build_topology(spec)
+        targets = [topology.service(service) for service in services]
+        notify(f"restarting {', '.join(targets) or 'all services'}")
+        self._compose(spec, "restart", *targets)
+        self._wait_healthy(topology, notify=notify)
+        return self.status(name)
+
     def down(self, name: str) -> None:
         """Remove containers, keeping data volumes and the instance definition."""
         self._compose(self.registry.load(name), "down", "--remove-orphans")
@@ -217,10 +234,89 @@ class Runtime:
 
     def client_command(self, name: str, node: str | None = None) -> list[str]:
         """The ``docker exec`` invocation that opens clickhouse-client on a node."""
-        status = self.status(name)
-        target = status.topology.node(node) if node else status.topology.nodes[0]
-        container = f"{status.spec.project_name}-{target.name}"
-        return ["docker", "exec", "-it", container, "clickhouse", "client", "--host", "127.0.0.1"]
+        topology = build_topology(self.registry.load(name))
+        target = topology.node(node) if node else topology.nodes[0]
+        return [
+            "docker",
+            "exec",
+            "-it",
+            topology.container(target.name),
+            "clickhouse",
+            "client",
+            "--host",
+            "127.0.0.1",
+        ]
+
+    def exec_command(
+        self,
+        name: str,
+        command: Iterable[str],
+        *,
+        service: str | None = None,
+        interactive: bool = False,
+        tty: bool = False,
+    ) -> list[str]:
+        """The ``docker exec`` invocation that runs ``command`` inside a service's container."""
+        topology = build_topology(self.registry.load(name))
+        flags = (["-i"] if interactive else []) + (["-t"] if tty else [])
+        return ["docker", "exec", *flags, topology.container(service), *command]
+
+    def copy_command(
+        self,
+        name: str,
+        *,
+        service: str | None,
+        container_path: str,
+        host_path: str,
+        to_container: bool,
+    ) -> list[str]:
+        """The ``docker cp`` invocation that moves a file into or out of a service."""
+        topology = build_topology(self.registry.load(name))
+        remote = f"{topology.container(service)}:{container_path}"
+        pair = [host_path, remote] if to_container else [remote, host_path]
+        return ["docker", "cp", *pair]
+
+    def client_script_command(
+        self,
+        name: str,
+        *,
+        node: str | None = None,
+        user: str = "default",
+        password: str = "",
+        database: str | None = None,
+        settings: dict[str, str] | None = None,
+        output_format: str | None = None,
+    ) -> list[str]:
+        """``clickhouse client --multiquery`` inside a node, reading statements from stdin.
+
+        Files of several statements go through the server's own client rather than the HTTP
+        interface: HTTP runs exactly one statement per request, and splitting SQL on ``;``
+        outside a real parser breaks on the first string literal that contains one.
+        """
+        topology = build_topology(self.registry.load(name))
+        target = topology.node(node) if node else topology.nodes[0]
+        command = [
+            "docker",
+            "exec",
+            "-i",
+            topology.container(target.name),
+            "clickhouse",
+            "client",
+            "--host",
+            "127.0.0.1",
+            "--multiquery",
+            "--user",
+            user,
+        ]
+        if password:
+            command += ["--password", password]
+        if database:
+            command += ["--database", database]
+        if output_format:
+            command += ["--format", output_format]
+        for key, value in (settings or {}).items():
+            command.append(f"--{key}={value}")
+        return command
 
     def query(
         self,

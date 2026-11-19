@@ -7,10 +7,12 @@ import json as jsonlib
 import os
 import shutil
 from dataclasses import replace
+from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -237,7 +239,15 @@ def up_command(
     ] = None,
     setting: Annotated[
         list[str] | None,
-        typer.Option("--setting", help="Server setting as key=value. Repeatable."),
+        typer.Option("--setting", help="Server setting (config.d) as key=value. Repeatable."),
+    ] = None,
+    query_setting: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--query-setting",
+            help="Query setting for every session, written into the default profile, as "
+            "key=value — e.g. allow_insert_into_iceberg=1. Repeatable.",
+        ),
     ] = None,
     seed: Annotated[
         bool | None,
@@ -283,6 +293,8 @@ def up_command(
             overrides["databases"] = tuple(parse_database(text) for text in database)
         if setting:
             overrides["settings"] = dict(parse_setting(text) for text in setting)
+        if query_setting:
+            overrides["profile_settings"] = dict(parse_setting(text) for text in query_setting)
 
         base = profiles_module.Profiles.default().get(profile) if profile else {}
         fields = profiles_module.apply(base, overrides)
@@ -413,35 +425,86 @@ def logs_command(
 @app.command("query")
 def query_command(
     name: NameArgument,
-    sql: Annotated[str, typer.Argument(help="SQL to run.")],
+    sql: Annotated[
+        str | None, typer.Argument(help="SQL to run: one statement. Use --file for several.")
+    ] = None,
+    file: Annotated[
+        str | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Run every statement in this file ('-' for stdin) through clickhouse-client "
+            "inside the node. Output is the client's own; stops at the first error.",
+        ),
+    ] = None,
     node: Annotated[str | None, typer.Option("--node", help="Run on this node.")] = None,
     all_nodes: Annotated[
         bool, typer.Option("--all", "-a", help="Run on every node and compare the results.")
     ] = False,
+    setting: Annotated[
+        list[str] | None,
+        typer.Option("--setting", "-s", help="Query setting as key=value. Repeatable."),
+    ] = None,
     user: Annotated[str, typer.Option("--user", "-u", help="ClickHouse user.")] = "default",
     password: Annotated[str, typer.Option("--password", help="ClickHouse password.")] = "",
     database: Annotated[str | None, typer.Option("--database", "-d")] = None,
+    output_format: Annotated[
+        str | None,
+        typer.Option("--format", help="With --file: the client's output format, e.g. TSV."),
+    ] = None,
     json: JsonOption = False,
 ) -> None:
-    """Run SQL against an instance."""
-    runtime = Runtime()
+    """Run SQL against an instance.
+
+    Exits 1 if the query fails on any node. With --json, failures are reported in the
+    output as {"node", "error", "code"}, where code is ClickHouse's error code.
+    """
     try:
-        if all_nodes:
-            results = runtime.query_all(name, sql, user=user, password=password, database=database)
-        else:
-            results = [
-                runtime.query(name, sql, node=node, user=user, password=password, database=database)
-            ]
+        settings = dict(parse_setting(text) for text in setting or [])
+        if (sql is None) == (file is None):
+            raise SpecError("give exactly one of SQL or --file")
     except ChlabError as failure:
         _fail(failure)
 
+    runtime = Runtime()
+    if file is not None:
+        if json:
+            _fail(SpecError("--json is not supported with --file; use --format JSONEachRow"))
+        _run_sql_file(
+            runtime,
+            name,
+            file,
+            node=node,
+            all_nodes=all_nodes,
+            user=user,
+            password=password,
+            database=database,
+            settings=settings,
+            output_format=output_format,
+        )
+        return
+
+    options = {"user": user, "password": password, "database": database, "settings": settings}
+    try:
+        if all_nodes:
+            results = runtime.query_all(name, sql, **options)
+        else:
+            try:
+                results = [runtime.query(name, sql, node=node, **options)]
+            except QueryError as failure:
+                results = [failure]
+    except ChlabError as failure:
+        _fail(failure)
+
+    failed = any(isinstance(result, QueryError) for result in results)
     if json:
         console.print_json(jsonlib.dumps([_result_as_dict(result) for result in results]))
-        return
+        raise typer.Exit(code=1 if failed else 0)
 
     for result in results:
         if isinstance(result, QueryError):
-            error_console.print(f"[bold red]{result.node}:[/bold red] {result}")
+            label = f"{result.node}: " if result.node else ""
+            error_console.print(f"[bold red]{escape(label)}error:[/bold red] {escape(str(result))}")
             continue
         if all_nodes:
             console.print(f"[bold]{result.node}[/bold]")
@@ -449,6 +512,35 @@ def query_command(
 
     if all_nodes:
         console.print(_agreement_line(results))
+    raise typer.Exit(code=1 if failed else 0)
+
+
+def _run_sql_file(runtime: Runtime, name: str, file: str, *, node, all_nodes, **options) -> None:
+    import subprocess
+    import sys
+
+    try:
+        script = sys.stdin.read() if file == "-" else Path(file).read_text()
+    except OSError as failure:
+        _fail(SpecError(f"could not read {file}: {failure.strerror or failure}"))
+
+    try:
+        nodes = list(runtime.status(name).topology.node_names) if all_nodes else [node]
+        commands = [
+            (target, runtime.client_script_command(name, node=target, **options))
+            for target in nodes
+        ]
+    except ChlabError as failure:
+        _fail(failure)
+
+    worst = 0
+    for target, command in commands:
+        if all_nodes:
+            console.print(f"[bold]{target}[/bold]")
+        # Streamed, not captured: the client's output is the result.
+        code = subprocess.run(command, input=script, text=True).returncode
+        worst = worst or code
+    raise typer.Exit(code=worst)
 
 
 @app.command("client")
@@ -466,6 +558,146 @@ def client_command(
         _fail(failure)
     # Hand the terminal over so the REPL behaves exactly as it would run directly.
     os.execvp(command[0], command)
+
+
+@app.command("exec")
+def exec_command(
+    name: NameArgument,
+    command: Annotated[
+        list[str] | None,
+        typer.Argument(help="Command to run. Put it after `--`. Defaults to bash."),
+    ] = None,
+    node: Annotated[
+        str | None,
+        typer.Option("--node", help="Node or keeper to run in. Defaults to the first node."),
+    ] = None,
+) -> None:
+    """Run a command inside a node's container, e.g. `chlab exec lab -- ls /var/lib/clickhouse`.
+
+    Exits with the command's own exit code. Stdin is passed through, and a terminal is
+    allocated only when there is one, so this works the same from scripts and by hand.
+    """
+    import subprocess
+    import sys
+
+    interactive_terminal = sys.stdin.isatty() and sys.stdout.isatty()
+    try:
+        docker_command = Runtime().exec_command(
+            name,
+            command or ["bash"],
+            service=node,
+            interactive=True,
+            tty=interactive_terminal,
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
+
+
+@app.command("cp")
+def cp_command(
+    source: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
+    destination: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
+) -> None:
+    """Copy files into or out of a node, like `docker cp`.
+
+    One side names the instance: `lab:/var/lib/clickhouse/user_files/x.parquet` is the first
+    node, `lab/clickhouse2:/tmp` a specific one. Directories are copied recursively.
+    """
+    import subprocess
+
+    runtime = Runtime()
+    try:
+        remote_source = _remote_path(source, runtime.registry)
+        remote_destination = _remote_path(destination, runtime.registry)
+        if (remote_source is None) == (remote_destination is None):
+            raise SpecError(
+                "exactly one side of `chlab cp` must be NAME[/NODE]:PATH, the other a local path"
+            )
+        to_container = remote_destination is not None
+        instance, node, container_path = remote_destination or remote_source
+        docker_command = runtime.copy_command(
+            instance,
+            service=node,
+            container_path=container_path,
+            host_path=source if to_container else destination,
+            to_container=to_container,
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
+
+
+def _remote_path(text: str, registry: Registry) -> tuple[str, str | None, str] | None:
+    """Parse NAME[/NODE]:PATH, or return None for a local path."""
+    prefix, separator, path = text.partition(":")
+    if not separator:
+        return None
+    instance, _, node = prefix.partition("/")
+    if not registry.exists(instance):
+        # A local path that happens to contain a colon, unless it looks like ours.
+        if "/" in instance or not instance:
+            return None
+        raise SpecError(f"no instance named {instance!r} (in {text!r})")
+    return instance, node or None, path or "/"
+
+
+@app.command("restart")
+def restart_command(
+    name: NameArgument,
+    node: Annotated[
+        list[str] | None,
+        typer.Option("--node", help="Restart only this node or keeper. Repeatable."),
+    ] = None,
+) -> None:
+    """Restart an instance's services and wait until they are ready again."""
+    runtime = Runtime()
+    with _spinner("restarting") as report:
+        try:
+            status = runtime.restart(name, node or (), on_event=report.event)
+        except ChlabError as failure:
+            _fail(failure)
+    console.print(f"restarted {', '.join(node) if node else name}: {status.state}")
+
+
+@app.command("env")
+def env_command(name: NameArgument, json: JsonOption = False) -> None:
+    """Endpoints, containers and credentials of an instance, from the host and the network."""
+    from .core.environment import describe
+
+    runtime = Runtime()
+    try:
+        info = describe(runtime.status(name), runtime.registry)
+    except ChlabError as failure:
+        _fail(failure)
+
+    if json:
+        console.print_json(jsonlib.dumps(info))
+        return
+
+    header = _kv_table()
+    for key in ("name", "state", "version", "cluster", "compose_project", "network", "directory"):
+        header.add_row(key, str(info[key] or "unknown"))
+    console.print(header)
+    console.print()
+
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    for column in ("SERVICE", "CONTAINER", "FROM HOST", "IN NETWORK"):
+        table.add_column(column, overflow="fold")
+    for node in info["nodes"]:
+        table.add_row(
+            node["name"], node["container"], node["host"]["http"], node["network"]["http"]
+        )
+        table.add_row("", "", node["host"]["native"], node["network"]["native"])
+    for keeper in info["keepers"]:
+        table.add_row(keeper["name"], keeper["container"], keeper["host"], keeper["network"])
+    console.print(table)
+    console.print()
+
+    users = _kv_table()
+    for user in info["users"]:
+        users.add_row(user["name"], f"password={user['password']!r} role={user['role']}")
+    console.print(users)
 
 
 # --- profiles ----------------------------------------------------------------------------
@@ -791,7 +1023,7 @@ def _status_as_dict(status: InstanceStatus) -> dict:
 
 def _result_as_dict(result) -> dict:
     if isinstance(result, QueryError):
-        return {"node": result.node, "error": str(result)}
+        return {"node": result.node, "error": str(result), "code": result.code}
     return {
         "node": result.node,
         "columns": result.columns,
@@ -803,7 +1035,7 @@ def _result_as_dict(result) -> dict:
 
 
 def _fail(failure: Exception) -> NoReturn:
-    error_console.print(f"[bold red]error:[/bold red] {failure}")
+    error_console.print(f"[bold red]error:[/bold red] {escape(str(failure))}")
     raise typer.Exit(code=1)
 
 

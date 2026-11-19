@@ -68,6 +68,11 @@ def _write_node_configs(
     # default user is allowed to create them.
     _write_xml(users_d / "10-chlab-default.xml", default_user_access_management())
 
+    if topology.spec.profile_settings:
+        _write_xml(
+            users_d / "20-chlab-profile.xml", profile_settings(topology.spec.profile_settings)
+        )
+
 
 def _write_keeper_configs(topology: Topology, keeper: KeeperNode, keeper_dir: Path) -> None:
     keeper_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +191,15 @@ def console_logging() -> dict[str, Any]:
 
 def server_settings(settings: dict[str, str]) -> dict[str, Any]:
     return dict(settings)
+
+
+def profile_settings(settings: dict[str, str]) -> dict[str, Any]:
+    """Query settings for every session, via the ``default`` profile.
+
+    SQL-created users inherit ``default_profile`` too, so this reaches them without a
+    per-user ``SETTINGS PROFILE`` clause.
+    """
+    return {"profiles": {"default": dict(settings)}}
 
 
 def keeper_config(keeper: KeeperNode, keepers: tuple[KeeperNode, ...]) -> dict[str, Any]:

@@ -86,11 +86,15 @@ chlab cache ls                  # everything resolved so far
 chlab up          launch a cluster
 chlab ls          list instances
 chlab status      one instance in detail
-chlab query       run SQL
+chlab query       run SQL, one statement or a file of them
 chlab client      interactive clickhouse-client
+chlab exec        run a command inside a node
+chlab cp          copy files into or out of a node
+chlab env         endpoints, containers and credentials
 chlab logs        server logs
 chlab stop        stop containers, keep data
 chlab start       start a stopped instance
+chlab restart     restart nodes and wait until they are ready
 chlab down        remove containers, keep data and definition
 chlab rm          delete everything, including data volumes
 chlab ui          web interface
@@ -111,7 +115,8 @@ chlab cache       inspect or clear the artifact cache
 | `-u`, `--user` | `name[:password][:role]`. Repeatable |
 | `--grant` | `user:PRIVILEGES ON target`. Repeatable |
 | `-d`, `--database` | `name[:Atomic\|Replicated]`. Repeatable |
-| `--setting` | Server setting as `key=value`. Repeatable |
+| `--setting` | Server setting (`config.d`) as `key=value`. Repeatable |
+| `--query-setting` | Query setting for every session (default profile), e.g. `allow_insert_into_iceberg=1`. Repeatable |
 | `--seed` | Create the `demo` database with generated rows |
 | `--cluster-name` | Name of the generated cluster (default `default_cluster`) |
 | `-p`, `--profile` | Start from a saved topology |
@@ -135,10 +140,29 @@ chlab query lab "SELECT 1" --node clickhouse3           # a specific node
 chlab query lab --all "SELECT count() FROM demo.events" # every node, with agreement check
 chlab query lab "SELECT 1" -u dev --password devpass    # as another user
 chlab query lab "SELECT 1" --json                       # machine-readable
+chlab query lab "SELECT 1" -s max_threads=1             # query settings, repeatable
+chlab query lab -f steps.sql                            # several statements
 ```
 
 `--all` runs the same SQL on every node and reports whether they agree — the quickest way to
 check replication or spot a node behaving differently.
+
+A failing query exits 1. With `--json` the failure is part of the output, as
+`{"node", "error", "code"}`, where `code` is ClickHouse's own error code (`497` for
+`ACCESS_DENIED`). `--file` (or `-f -` for stdin) runs the statements through
+`clickhouse-client --multiquery` inside the node, stops at the first error, and exits with the
+client's code.
+
+### Looking inside
+
+```bash
+chlab exec lab -- ls /var/lib/clickhouse/user_files     # first node; exits with the command's code
+chlab exec lab --node keeper1 -- cat /etc/clickhouse-keeper/keeper_config.xml
+chlab cp ./data.parquet lab:/var/lib/clickhouse/user_files/
+chlab cp lab/clickhouse2:/var/lib/clickhouse/user_files/t/metadata ./metadata
+chlab restart lab --node clickhouse2                    # e.g. does a setting survive reopen?
+chlab env lab --json                                    # ports, containers, network, users
+```
 
 ## Examples
 

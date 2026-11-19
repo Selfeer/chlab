@@ -86,6 +86,10 @@ class ClusterSpec:
     seed: bool = False
     #: Extra server settings merged into config.d as ``<key>value</key>``.
     settings: dict[str, str] = field(default_factory=dict)
+    #: Query-level settings written into the ``default`` settings profile, so they apply to
+    #: every session and every user — ``allow_insert_into_iceberg`` and friends, which are
+    #: not server settings and are silently ignored in config.d.
+    profile_settings: dict[str, str] = field(default_factory=dict)
     #: First host port of this instance's allocated block; assigned at creation.
     port_base: int | None = None
 
@@ -95,6 +99,7 @@ class ClusterSpec:
         # Copied so a caller mutating the dict it passed in cannot change this spec. The
         # dataclass is frozen but that only guards rebinding, not the dict's contents.
         object.__setattr__(self, "settings", dict(self.settings))
+        object.__setattr__(self, "profile_settings", dict(self.profile_settings))
 
         if not NAME_PATTERN.match(self.name):
             raise SpecError(
@@ -110,7 +115,7 @@ class ClusterSpec:
             )
         if self.keeper_nodes is not None and self.keeper_nodes < 0:
             raise SpecError("keeper_nodes cannot be negative")
-        for key in self.settings:
+        for key in (*self.settings, *self.profile_settings):
             validate_setting_key(key)
         for database in self.databases:
             if database.engine == "Replicated" and self.effective_keeper_nodes == 0:
