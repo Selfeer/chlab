@@ -147,6 +147,7 @@ const chlab = (() => {
         const option = event.target.selectedOptions[0];
         const profile = option.dataset.profile ? JSON.parse(option.dataset.profile) : null;
         if (!profile) return;
+        if (profile.source) form.source.value = profile.source;
         form.shards.value = profile.shards ?? 1;
         form.replicas.value = profile.replicas ?? 1;
         form.keeper_nodes.value = profile.keeper_nodes === null || profile.keeper_nodes === undefined

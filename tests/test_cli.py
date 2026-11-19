@@ -676,3 +676,83 @@ def test_every_help_page_renders():
     for path in paths:
         result = invoke(*path, "--help")
         assert result.exit_code == 0, (path, result.output, result.exception)
+
+
+# --- profiles that keep their build, and picking one --------------------------------------
+
+
+def test_a_profile_saved_with_its_build_launches_without_c(saved_instance, monkeypatch):
+    from chlab.core.profiles import Profiles
+
+    result = invoke("profiles", "save", "full", "lab", "--with-build")
+    assert result.exit_code == 0, result.output
+    assert Profiles.default().get("full")["source"] == "/bin/clickhouse"
+    assert "/bin/clickhouse" in invoke("profiles", "ls").output
+
+    seen = captured_spec(monkeypatch)
+    result = invoke("up", "-n", "again", "-p", "full")
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].source == "/bin/clickhouse"
+    assert (seen["spec"].shards, seen["spec"].replicas) == (2, 1)
+    # The version is not kept: the build identifies it.
+    assert seen["spec"].version is None
+
+
+def test_c_overrides_the_saved_build(saved_instance, monkeypatch):
+    invoke("profiles", "save", "full", "lab", "--with-build")
+    seen = captured_spec(monkeypatch)
+    assert invoke("up", "-c", "/other/clickhouse", "-n", "x", "-p", "full").exit_code == 0
+    assert seen["spec"].source == "/other/clickhouse"
+
+
+def test_a_profile_without_a_build_still_needs_c(saved_instance, monkeypatch):
+    invoke("profiles", "save", "shape", "lab")
+    captured_spec(monkeypatch)
+    result = invoke("up", "-n", "x", "-p", "shape")
+    assert result.exit_code != 0
+    assert "--with-build" in result.output
+    assert invoke("up", "-n", "x").exit_code != 0
+
+
+def test_profiles_saved_without_a_build_do_not_keep_it(saved_instance):
+    from chlab.core.profiles import Profiles
+
+    invoke("profiles", "save", "shape", "lab")
+    assert "source" not in Profiles.default().get("shape")
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        (["up", "-p"], ["up", "-p", ""]),
+        (["up", "--profile", "-n", "x"], ["up", "--profile", "", "-n", "x"]),
+        (["up", "-p", "lake"], ["up", "-p", "lake"]),
+        (["query", "lab", "-p"], ["query", "lab", "-p"]),
+    ],
+)
+def test_a_bare_profile_flag_means_pick(args, expected):
+    from chlab.cli import _bare_profile_flag
+
+    assert _bare_profile_flag(args) == expected
+
+
+def test_up_picks_a_profile_from_the_list(saved_instance, monkeypatch):
+    invoke("profiles", "save", "a-shape", "lab")
+    invoke("profiles", "save", "b-full", "lab", "--with-build")
+    monkeypatch.setattr("chlab.cli._can_prompt", lambda: True)
+    seen = captured_spec(monkeypatch)
+
+    result = runner.invoke(app, ["up", "-n", "picked", "-p", ""], input="9\n2\n")
+    assert result.exit_code == 0, result.output
+    assert "a-shape" in result.output and "b-full" in result.output
+    assert seen["spec"].source == "/bin/clickhouse"
+
+    result = runner.invoke(app, ["up", "-n", "named", "-p", ""], input="b-full\n")
+    assert result.exit_code == 0, result.output
+
+
+def test_picking_without_a_terminal_lists_the_names(saved_instance):
+    invoke("profiles", "save", "a-shape", "lab")
+    result = invoke("up", "-p", "")
+    assert result.exit_code != 0
+    assert "a-shape" in result.output

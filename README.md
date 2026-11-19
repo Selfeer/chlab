@@ -113,7 +113,7 @@ chlab cache       inspect or clear the artifact cache
 
 | Option | Meaning |
 |---|---|
-| `-c`, `--clickhouse` | **Required.** Image, URL, package or binary path |
+| `-c`, `--clickhouse` | Image, URL, package or binary path. Required unless the profile was saved `--with-build` |
 | `-n`, `--name` | Instance name. Derived from the version if omitted |
 | `-s`, `--shards` | Number of shards (default 1) |
 | `-r`, `--replicas` | Replicas per shard (default 1) |
@@ -128,7 +128,7 @@ chlab cache       inspect or clear the artifact cache
 | `--s3-user` | Extra S3 identity, `name:secret[:readwrite\|readonly\|writeonly[:bucket,…]]`. Repeatable |
 | `--seed` | Create the `demo` database with generated rows |
 | `--cluster-name` | Name of the generated cluster (default `default_cluster`) |
-| `-p`, `--profile` | Start from a saved topology |
+| `-p`, `--profile` | Start from a saved profile; `-p` alone lists them and asks which |
 | `--clickhouse-version` | Skip version detection |
 | `--force-resolve` | Re-download, ignoring the cache |
 | `--sha256` | Verify the download against a checksum |
@@ -409,11 +409,16 @@ chlab query repl --all "SELECT getMacro('shard'), count() FROM demo.events_local
 chlab query repl "SELECT table, total_replicas, active_replicas FROM system.replicas"
 ```
 
-**Reuse a topology against a different build**
+**Save a setup and launch it again**
 
 ```bash
-chlab profiles save 2x2-seeded repl
+chlab profiles save 2x2-seeded repl                 # the setup, without the build
 chlab up -c <any other source> --profile 2x2-seeded
+
+chlab profiles save lake-2x2 lake --with-build      # the setup and its build
+chlab up --profile lake-2x2                         # no -c needed; -c still overrides it
+chlab up -p                                         # pick from the list of profiles
+chlab profiles ls                                   # name, build, topology
 ```
 
 **Tune server settings**

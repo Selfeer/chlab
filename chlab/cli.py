@@ -6,6 +6,7 @@ import hashlib
 import json as jsonlib
 import os
 import shutil
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -215,13 +216,14 @@ def cache_clear(
 @app.command("up")
 def up_command(
     clickhouse: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--clickhouse",
             "-c",
-            help="docker:// image, http(s) URL, .deb/.tgz package, or path to a binary.",
+            help="docker:// image, http(s) URL, .deb/.tgz package, or path to a binary. "
+            "Optional with a profile saved --with-build.",
         ),
-    ],
+    ] = None,
     name: Annotated[
         str | None,
         typer.Option("--name", "-n", help="Instance name. Derived from the version if omitted."),
@@ -308,7 +310,12 @@ def up_command(
         str | None, typer.Option("--cluster-name", help="Name of the generated cluster.")
     ] = None,
     profile: Annotated[
-        str | None, typer.Option("--profile", "-p", help="Start from a saved profile.")
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Start from a saved profile. Without a name, pick one from the list.",
+        ),
     ] = None,
     force_resolve: Annotated[
         bool, typer.Option("--force-resolve", help="Re-download the source, ignoring the cache.")
@@ -350,11 +357,21 @@ def up_command(
         if s3_user:
             overrides["s3_users"] = tuple(parse_s3_user(text) for text in s3_user)
 
+        if profile == "":
+            profile = _pick_profile()
         base = profiles_module.Profiles.default().get(profile) if profile else {}
+        source = clickhouse or profiles_module.build(base)
+        if not source:
+            raise SpecError(
+                f"profile {profile!r} has no build saved with it; pass --clickhouse, or save it "
+                "with `chlab profiles save NAME INSTANCE --with-build`"
+                if profile
+                else "give the build with --clickhouse (-c), or use a profile saved --with-build"
+            )
         fields = profiles_module.apply(base, overrides)
         taken = set() if recreate else {spec.name for spec in registry.list()}
-        instance_name = name or suggest_name(clickhouse, taken=taken)
-        spec = ClusterSpec(name=instance_name, source=clickhouse, version=version, **fields)
+        instance_name = name or suggest_name(source, taken=taken)
+        spec = ClusterSpec(name=instance_name, source=source, version=version, **fields)
     except ChlabError as failure:
         _fail(failure)
 
@@ -1373,26 +1390,75 @@ def profiles_ls(json: JsonOption = False) -> None:
         )
         return
 
+    console.print(_profiles_table(saved))
+
+
+def _profiles_table(saved: dict, *, numbered: bool = False) -> Table:
     table = Table(box=None, padding=(0, 2, 0, 0))
+    if numbered:
+        table.add_column("#", justify="right")
     table.add_column("PROFILE", style="bold")
+    table.add_column("BUILD", overflow="fold")
     table.add_column("TOPOLOGY")
-    for profile_name, profile in sorted(saved.items()):
-        table.add_row(profile_name, profiles_module.summarise(profile))
-    console.print(table)
+    for index, (profile_name, profile) in enumerate(sorted(saved.items()), start=1):
+        row = [
+            escape(profile_name),
+            escape(profiles_module.build(profile) or "-"),
+            escape(profiles_module.summarise(profile)),
+        ]
+        table.add_row(*([str(index)] if numbered else []), *row)
+    return table
+
+
+def _can_prompt() -> bool:
+    return sys.stdin.isatty()
+
+
+def _pick_profile() -> str:
+    """Ask which saved profile to launch, for `chlab up -p` without a name."""
+    saved = profiles_module.Profiles.default().all()
+    if not saved:
+        raise SpecError("no saved profiles; save one with `chlab profiles save NAME INSTANCE`")
+    names = sorted(saved)
+    if not _can_prompt():
+        raise SpecError(
+            "pick a profile by name with --profile NAME (no terminal to ask on); saved: "
+            + ", ".join(names)
+        )
+    console.print(_profiles_table(saved, numbered=True))
+    while True:
+        answer = typer.prompt("Profile (number or name)").strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        if answer in saved:
+            return answer
+        error_console.print(f"no profile {escape(answer)!r}; give 1-{len(names)} or a name")
 
 
 @profiles_app.command("save")
 def profiles_save(
     profile_name: Annotated[str, typer.Argument(help="Name for the profile.")],
     instance: Annotated[str, typer.Argument(help="Instance to copy the topology from.")],
+    with_build: Annotated[
+        bool,
+        typer.Option(
+            "--with-build",
+            help="Also keep the instance's build, so `chlab up --profile NAME` needs no -c.",
+        ),
+    ] = False,
 ) -> None:
-    """Save a running instance's topology as a reusable profile."""
+    """Save an instance's setup as a reusable profile: topology, users, settings, services.
+
+    The build is left out unless --with-build is given, so by default a profile is a shape
+    to launch against any build.
+    """
     try:
         spec = Registry().load(instance)
-        profiles_module.Profiles.default().save(profile_name, spec)
+        profiles_module.Profiles.default().save(profile_name, spec, include_build=with_build)
     except ChlabError as failure:
         _fail(failure)
-    console.print(f"saved profile [bold]{profile_name}[/bold] from {instance}")
+    detail = f" with build {escape(spec.source)}" if with_build else ""
+    console.print(f"saved profile [bold]{escape(profile_name)}[/bold] from {instance}{detail}")
 
 
 @profiles_app.command("rm")
@@ -1729,7 +1795,26 @@ def _fail(failure: Exception) -> NoReturn:
 
 
 def main() -> None:
+    sys.argv[1:] = _bare_profile_flag(sys.argv[1:])
     app()
+
+
+def _bare_profile_flag(args: list[str]) -> list[str]:
+    """Give `chlab up -p` with no name an empty value, which means "pick from the list".
+
+    Typer options always take a value, so a bare `-p` would otherwise swallow the next option
+    or fail at the end of the line.
+    """
+    if not args or args[0] != "up":
+        return args
+    expanded = []
+    for index, arg in enumerate(args):
+        expanded.append(arg)
+        if arg in ("-p", "--profile"):
+            following = args[index + 1] if index + 1 < len(args) else None
+            if following is None or following.startswith("-"):
+                expanded.append("")
+    return expanded
 
 
 if __name__ == "__main__":

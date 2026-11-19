@@ -1,9 +1,15 @@
 """Saved topologies.
 
-A profile is a ClusterSpec with the instance-specific parts removed — no name, no source, no
-ports — so the same shape can be relaunched against any binary:
+A profile is a ClusterSpec with the instance-specific parts removed — no name, no ports — so
+the same shape can be relaunched against any binary:
 
     chlab up --clickhouse <any source> --profile 3x2
+
+Saved with ``--with-build``, a profile also keeps the build it came from, and then needs no
+``--clickhouse`` at all (one given still wins):
+
+    chlab profiles save lake-2x2 lake --with-build
+    chlab up --profile lake-2x2
 """
 
 from __future__ import annotations
@@ -20,6 +26,9 @@ from .spec import ClusterSpec, DatabaseSpec, S3UserSpec, UserSpec, construct
 ENV_CONFIG_DIR = "CHLAB_CONFIG_DIR"
 #: Fields a profile never carries, because they identify a particular instance.
 INSTANCE_FIELDS = frozenset({"name", "source", "version", "port_base"})
+#: Where a profile saved with its build keeps it. The version is not kept: the build
+#: identifies it, and a stale version would override detection for a different build.
+BUILD_FIELD = "source"
 
 
 class ProfileNotFound(ChlabError):
@@ -77,11 +86,13 @@ class Profiles:
             raise ProfileNotFound(name)
         return data[name]
 
-    def save(self, name: str, spec: ClusterSpec) -> None:
+    def save(self, name: str, spec: ClusterSpec, *, include_build: bool = False) -> None:
         data = self._read()
         data[name] = {
             key: value for key, value in spec.to_dict().items() if key not in INSTANCE_FIELDS
         }
+        if include_build:
+            data[name][BUILD_FIELD] = spec.source
         self._write(data)
 
     def delete(self, name: str) -> None:
@@ -92,9 +103,18 @@ class Profiles:
         self._write(data)
 
 
+def build(profile: dict[str, Any]) -> str | None:
+    """The build a profile was saved with, if it was saved with one."""
+    value = profile.get(BUILD_FIELD)
+    return value if isinstance(value, str) and value else None
+
+
 def apply(profile: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
-    """Merge a profile under explicit overrides, which always win."""
-    merged = dict(profile)
+    """Merge a profile under explicit overrides, which always win.
+
+    The result never names a build or an instance: the caller passes those separately.
+    """
+    merged = {key: value for key, value in profile.items() if key not in INSTANCE_FIELDS}
     merged.update({key: value for key, value in overrides.items() if value is not None})
     if "users" in merged:
         merged["users"] = tuple(
@@ -114,7 +134,7 @@ def apply(profile: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     # A profile written by a newer chlab may carry fields this version has never heard of.
     # Dropping them here keeps `--profile` working instead of raising TypeError at the
     # ClusterSpec constructor.
-    known = set(ClusterSpec.__dataclass_fields__)
+    known = set(ClusterSpec.__dataclass_fields__) - INSTANCE_FIELDS
     return {key: value for key, value in merged.items() if key in known}
 
 
