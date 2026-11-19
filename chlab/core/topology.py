@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .errors import ChlabError
-from .spec import MAX_NODES, ClusterSpec
+from .spec import MAX_KEEPERS, MAX_NODES, ClusterSpec
 
 #: Host ports for a node are ``port_base + index * NODE_PORT_STRIDE + offset``.
 NODE_PORT_STRIDE = 10
@@ -14,6 +14,8 @@ TCP_OFFSET = 1
 #: Keeper client ports sit immediately above the largest possible ClickHouse block. Derived
 #: rather than chosen, so the two ranges cannot silently overlap if MAX_NODES ever changes.
 KEEPER_PORT_BASE_OFFSET = MAX_NODES * NODE_PORT_STRIDE
+#: Companion services (s3, catalogs) get a stride each above the largest keeper block.
+SERVICE_PORT_BASE_OFFSET = KEEPER_PORT_BASE_OFFSET + MAX_KEEPERS * NODE_PORT_STRIDE
 
 CONTAINER_HTTP_PORT = 8123
 CONTAINER_TCP_PORT = 9000
@@ -57,10 +59,25 @@ class KeeperNode:
 
 
 @dataclass(frozen=True)
+class ServiceNode:
+    """A companion service: object storage, a catalog. Its module defines what runs."""
+
+    name: str
+    #: First of the ``NODE_PORT_STRIDE`` host ports reserved for this service.
+    port_base: int
+
+    def port(self, offset: int) -> int:
+        if not 0 <= offset < NODE_PORT_STRIDE:
+            raise ValueError(f"service port offset {offset} is outside the reserved stride")
+        return self.port_base + offset
+
+
+@dataclass(frozen=True)
 class Topology:
     spec: ClusterSpec
     nodes: tuple[Node, ...]
     keepers: tuple[KeeperNode, ...]
+    services: tuple[ServiceNode, ...] = ()
 
     @property
     def uses_keeper(self) -> bool:
@@ -78,6 +95,36 @@ class Topology:
     @property
     def node_names(self) -> tuple[str, ...]:
         return tuple(node.name for node in self.nodes)
+
+    @property
+    def service_names(self) -> tuple[str, ...]:
+        """Every compose service of the instance: ClickHouse nodes, keepers, companions."""
+        return (
+            *self.node_names,
+            *(keeper.name for keeper in self.keepers),
+            *(service.name for service in self.services),
+        )
+
+    def companion(self, name: str) -> ServiceNode | None:
+        for service in self.services:
+            if service.name == name:
+                return service
+        return None
+
+    def service(self, name: str | None) -> str:
+        """Validate a service name, defaulting to the first ClickHouse node."""
+        if name is None:
+            return self.nodes[0].name
+        if name not in self.service_names:
+            raise UnknownNode(
+                f"{name!r} is not a service of {self.spec.name}; "
+                f"expected one of {', '.join(self.service_names)}"
+            )
+        return name
+
+    def container(self, service: str | None = None) -> str:
+        """Docker container name of a service."""
+        return f"{self.spec.project_name}-{self.service(service)}"
 
     def shard_layout(self) -> list[list[Node]]:
         """Nodes grouped by shard, in shard order."""
@@ -121,11 +168,25 @@ def build_topology(spec: ClusterSpec) -> Topology:
         for index in range(1, spec.effective_keeper_nodes + 1)
     )
 
-    return Topology(spec=spec, nodes=tuple(nodes), keepers=keepers)
+    services = tuple(
+        ServiceNode(
+            name=name,
+            port_base=spec.port_base + SERVICE_PORT_BASE_OFFSET + index * NODE_PORT_STRIDE,
+        )
+        for index, name in enumerate(spec.services)
+    )
+
+    return Topology(spec=spec, nodes=tuple(nodes), keepers=keepers, services=services)
 
 
 def port_span(spec: ClusterSpec) -> int:
-    """How many consecutive host ports an instance needs, from ``port_base``."""
+    """How many consecutive host ports an instance needs, from ``port_base``.
+
+    An instance without services keeps the span it always had, so the blocks of instances
+    created by an earlier chlab still describe what they hold.
+    """
+    if spec.services:
+        return SERVICE_PORT_BASE_OFFSET + len(spec.services) * NODE_PORT_STRIDE
     keeper_span = KEEPER_PORT_BASE_OFFSET + max(spec.effective_keeper_nodes, 1) * NODE_PORT_STRIDE
     node_span = spec.node_count * NODE_PORT_STRIDE
     return max(node_span, keeper_span)

@@ -27,7 +27,7 @@ build-backend = "setuptools.build_meta"
 include = ["chlab*"]
 
 [tool.setuptools.package-data]
-chlab = ["web/templates/*.html", "web/static/*"]
+chlab = ["web/templates/*.html", "web/static/**/*", "toolbox/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

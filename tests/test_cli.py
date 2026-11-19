@@ -274,3 +274,385 @@ def test_cache_rm_reports_a_miss():
     result = invoke("cache", "rm", "24.8")
     assert result.exit_code == 1
     assert "nothing cached matches" in result.output
+
+
+# --- reproduction primitives -------------------------------------------------------------
+
+
+def test_query_settings_at_launch_go_into_the_profile(monkeypatch):
+    seen = captured_spec(monkeypatch)
+    result = invoke("up", "-c", "/x", "-n", "lab", "--query-setting", "allow_insert_into_iceberg=1")
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].profile_settings == {"allow_insert_into_iceberg": "1"}
+    assert seen["spec"].settings == {}
+
+
+def test_query_failure_reports_the_error_code_as_json_and_exits_1(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        raise QueryError("Code: 60. DB::Exception: Unknown table", node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    result = invoke("query", "lab", "SELECT * FROM nope", "--json")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == [
+        {"node": "clickhouse1", "error": "Code: 60. DB::Exception: Unknown table", "code": 60}
+    ]
+
+
+def test_query_passes_settings_through(saved_instance, monkeypatch):
+    from chlab.core.query import QueryResult
+
+    seen = {}
+
+    def capture(self, name, sql, **kwargs):
+        seen.update(kwargs)
+        return QueryResult(node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", capture)
+    result = invoke("query", "lab", "SELECT 1", "-s", "max_threads=1", "--setting", "a.b=2")
+    assert result.exit_code == 0, result.output
+    assert seen["settings"] == {"max_threads": "1", "a.b": "2"}
+
+
+def test_fan_out_exits_1_when_any_node_fails(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError, QueryResult
+
+    monkeypatch.setattr(
+        Runtime,
+        "query_all",
+        lambda self, name, sql, **kw: [
+            QueryResult(columns=["x"], rows=[[1]], node="clickhouse1"),
+            QueryError("Code: 497. ACCESS_DENIED", node="clickhouse2"),
+        ],
+    )
+    result = invoke("query", "lab", "SELECT 1", "--all")
+    assert result.exit_code == 1
+
+
+def test_server_errors_with_brackets_are_printed_verbatim(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        raise QueryError("Code: 47. Unknown identifier [bold]x[/bold]", node="clickhouse1")
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    result = invoke("query", "lab", "SELECT x")
+    assert "[bold]x[/bold]" in result.output
+
+
+@pytest.mark.parametrize("args", [[], ["SELECT 1", "--file", "x.sql"]])
+def test_query_needs_exactly_one_of_sql_or_file(saved_instance, args):
+    result = invoke("query", "lab", *args)
+    assert result.exit_code == 1
+    assert "exactly one" in result.output
+
+
+def test_query_file_runs_through_the_client_on_every_node(saved_instance, monkeypatch, tmp_path):
+    script = tmp_path / "steps.sql"
+    script.write_text("SELECT 1; SELECT 2;")
+    runs = []
+
+    class Done:
+        returncode = 0
+
+    def fake_run(command, input, text):
+        runs.append((command, input))
+        return Done()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = invoke("query", "lab", "--file", str(script), "--all")
+    assert result.exit_code == 0, result.output
+    assert [command[3] for command, _ in runs] == ["chlab-lab-clickhouse1", "chlab-lab-clickhouse2"]
+    assert all(stdin == "SELECT 1; SELECT 2;" for _, stdin in runs)
+
+
+def test_query_file_propagates_the_client_exit_code(saved_instance, monkeypatch, tmp_path):
+    script = tmp_path / "steps.sql"
+    script.write_text("SELEKT 1")
+
+    class Failed:
+        returncode = 62
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: Failed())
+    assert invoke("query", "lab", "-f", str(script)).exit_code == 62
+
+
+def test_exec_returns_the_command_exit_code(saved_instance, monkeypatch):
+    seen = {}
+
+    def fake_call(command):
+        seen["command"] = command
+        return 3
+
+    monkeypatch.setattr("subprocess.call", fake_call)
+    result = invoke("exec", "lab", "--node", "clickhouse2", "--", "ls", "-la", "/")
+    assert result.exit_code == 3
+    assert seen["command"][-4:] == ["chlab-lab-clickhouse2", "ls", "-la", "/"]
+
+
+def test_exec_reports_an_unknown_node(saved_instance):
+    result = invoke("exec", "lab", "--node", "clickhouse9", "--", "true")
+    assert result.exit_code == 1
+    assert "clickhouse9" in result.output
+
+
+@pytest.mark.parametrize(
+    "source, destination, expected",
+    [
+        ("./x.parquet", "lab:/tmp/", ["./x.parquet", "chlab-lab-clickhouse1:/tmp/"]),
+        ("lab/clickhouse2:/tmp/x", "./x", ["chlab-lab-clickhouse2:/tmp/x", "./x"]),
+    ],
+)
+def test_cp_maps_instance_paths_to_containers(
+    saved_instance, monkeypatch, source, destination, expected
+):
+    seen = {}
+    monkeypatch.setattr("subprocess.call", lambda command: seen.setdefault("c", command) and 0)
+    result = invoke("cp", source, destination)
+    assert result.exit_code == 0, result.output
+    assert seen["c"] == ["docker", "cp", *expected]
+
+
+@pytest.mark.parametrize(
+    "source, destination", [("./a", "./b"), ("lab:/a", "lab:/b"), ("nope:/a", "./b")]
+)
+def test_cp_needs_exactly_one_instance_side(saved_instance, source, destination):
+    assert invoke("cp", source, destination).exit_code == 1
+
+
+def test_env_json_describes_how_to_reach_the_instance(saved_instance):
+    result = invoke("env", "lab", "--json")
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.stdout)
+    assert [node["container"] for node in info["nodes"]] == [
+        "chlab-lab-clickhouse1",
+        "chlab-lab-clickhouse2",
+    ]
+    assert info["network"] == "chlab-lab_default"
+
+
+def test_env_reports_an_unknown_instance():
+    assert invoke("env", "nope").exit_code == 1
+
+
+# --- services and s3 ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def s3_instance(isolated_state: Path) -> ClusterSpec:
+    from chlab.core.spec import S3UserSpec
+
+    spec = ClusterSpec(
+        name="lake",
+        source="/bin/clickhouse",
+        port_base=21000,
+        services=("s3",),
+        s3_users=(S3UserSpec("reader", "readerpass", "readonly"),),
+    )
+    Registry().save(spec)
+    return spec
+
+
+def capture_call(monkeypatch) -> list:
+    calls: list = []
+    monkeypatch.setattr("subprocess.call", lambda command: calls.append(command) or 0)
+    return calls
+
+
+def test_up_accepts_services_buckets_and_s3_users(monkeypatch):
+    seen = captured_spec(monkeypatch)
+    result = invoke(
+        "up",
+        "-c",
+        "/x",
+        "-n",
+        "lake",
+        "--with",
+        "s3",
+        "--bucket",
+        "warehouse",
+        "--bucket",
+        "other",
+        "--s3-user",
+        "reader:readerpass:readonly:other",
+    )
+    assert result.exit_code == 0, result.output
+    spec = seen["spec"]
+    assert spec.services == ("s3",)
+    assert spec.buckets == ("warehouse", "other")
+    assert spec.s3_users[0].buckets == ("other",)
+
+
+def test_buckets_without_s3_are_refused_before_launch(monkeypatch):
+    captured_spec(monkeypatch)
+    result = invoke("up", "-c", "/x", "-n", "lake", "--bucket", "data")
+    assert result.exit_code == 1
+    assert "--with s3" in result.output
+
+
+def test_s3_commands_need_the_s3_service(saved_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    result = invoke("s3", "ls", "lab")
+    assert result.exit_code == 1
+    assert "no s3 service" in result.output
+    assert calls == []
+
+
+def test_s3_ls_lists_through_mc(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "ls", "lake", "warehouse/data", "-r").exit_code == 0
+    assert calls[0][-3:] == ["ls", "--recursive", "s3/warehouse/data"]
+
+
+def test_s3_put_mounts_each_source_read_only(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    (tmp_path / "a.parquet").write_bytes(b"PAR1")
+    (tmp_path / "dir").mkdir()
+    result = invoke(
+        "s3", "put", "lake", str(tmp_path / "a.parquet"), str(tmp_path / "dir"), "warehouse/in/"
+    )
+    assert result.exit_code == 0, result.output
+    command = calls[0]
+    assert f"{tmp_path / 'a.parquet'}:/chlab-in/0/a.parquet:ro" in command
+    assert f"{tmp_path / 'dir'}:/chlab-in/1/dir:ro" in command
+    assert command[-4:] == [
+        "--recursive",
+        "/chlab-in/0/a.parquet",
+        "/chlab-in/1/dir",
+        "s3/warehouse/in/",
+    ]
+
+
+def test_s3_put_reports_a_missing_source(s3_instance, monkeypatch):
+    capture_call(monkeypatch)
+    result = invoke("s3", "put", "lake", "./nope.parquet", "warehouse/")
+    assert result.exit_code == 1 and "does not exist" in result.output
+
+
+def test_s3_get_into_a_directory_mounts_it_writable(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "get", "lake", "warehouse/t/", str(tmp_path)).exit_code == 0
+    assert f"{tmp_path}:/chlab-out" in calls[0]
+    assert calls[0][-2:] == ["s3/warehouse/t/", "/chlab-out/"]
+
+
+def test_s3_get_to_a_new_file_name(s3_instance, monkeypatch, tmp_path: Path):
+    calls = capture_call(monkeypatch)
+    assert (
+        invoke("s3", "get", "lake", "warehouse/m.json", str(tmp_path / "copy.json")).exit_code == 0
+    )
+    assert calls[0][-1] == "/chlab-out/copy.json"
+
+
+def test_s3_commands_can_act_as_another_user(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "cat", "lake", "warehouse/x", "--as", "reader").exit_code == 0
+    assert "MC_HOST_s3=http://reader:readerpass@s3:9000" in calls[0]
+
+
+def test_s3_mc_passes_arguments_and_stdin_through(s3_instance, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("s3", "mc", "lake", "--", "stat", "s3/warehouse/x").exit_code == 0
+    assert "-i" in calls[0] and calls[0][-2:] == ["stat", "s3/warehouse/x"]
+
+
+def test_s3_exit_codes_are_mc_exit_codes(s3_instance, monkeypatch):
+    monkeypatch.setattr("subprocess.call", lambda command: 1)
+    assert invoke("s3", "rm", "lake", "warehouse/x").exit_code == 1
+
+
+def test_query_events_are_reported_per_result(saved_instance, monkeypatch):
+    from chlab.core.query import QueryResult
+
+    def run(self, name, sql, **kwargs):
+        assert kwargs["query_id"].startswith("chlab-")
+        return QueryResult(
+            columns=["x"], rows=[[1]], node="clickhouse1", query_id=kwargs["query_id"]
+        )
+
+    monkeypatch.setattr(Runtime, "query", run)
+    monkeypatch.setattr(
+        Runtime, "profile_events", lambda self, name, query_id, pattern: {"S3GetObject": 4}
+    )
+    result = invoke("query", "lab", "SELECT 1", "--events", "S3", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)[0]["events"] == {"S3GetObject": 4}
+
+
+def test_query_events_are_collected_for_failed_queries_too(saved_instance, monkeypatch):
+    from chlab.core.query import QueryError
+
+    def fail(self, name, sql, **kwargs):
+        failure = QueryError("Code: 499. S3_ERROR", node="clickhouse1")
+        failure.query_id = kwargs["query_id"]
+        raise failure
+
+    monkeypatch.setattr(Runtime, "query", fail)
+    monkeypatch.setattr(Runtime, "profile_events", lambda self, *a: {"S3GetObject": 1})
+    result = invoke("query", "lab", "SELECT 1", "-e", ".", "--json")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)[0] == {
+        "node": "clickhouse1",
+        "error": "Code: 499. S3_ERROR",
+        "code": 499,
+        "query_id": json.loads(result.stdout)[0]["query_id"],
+        "events": {"S3GetObject": 1},
+    }
+
+
+def test_profiles_carry_services_and_s3_users(s3_instance):
+    from chlab.core import profiles
+
+    assert invoke("profiles", "save", "lakehouse", "lake").exit_code == 0
+    fields = profiles.apply(profiles.Profiles.default().get("lakehouse"), {})
+    rebuilt = ClusterSpec(name="again", source="/y", **fields)
+    assert rebuilt.services == ("s3",)
+    assert rebuilt.s3_users == s3_instance.s3_users
+
+
+# --- tools container ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_build(monkeypatch):
+    monkeypatch.setattr("chlab.core.image.ensure_tools_image", lambda: "chlab/tools:test")
+
+
+def test_py_mounts_the_script_and_passes_its_arguments(
+    saved_instance, no_build, monkeypatch, tmp_path
+):
+    script = tmp_path / "make.py"
+    script.write_text("print(1)")
+    calls = []
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: calls.append(command) or 0)
+    result = invoke("py", "lab", str(script), "--rows", "10")
+    assert result.exit_code == 0, result.output
+    assert f"{script}:/chlab/run/make.py:ro" in calls[0]
+    assert calls[0][-5:] == ["chlab/tools:test", "python", "/chlab/run/make.py", "--rows", "10"]
+
+
+def test_py_reads_a_script_from_stdin(saved_instance, no_build, monkeypatch):
+    calls = []
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: calls.append(command) or 0)
+    assert invoke("py", "lab", "-").exit_code == 0
+    assert "-i" in calls[0] and calls[0][-2:] == ["python", "-"]
+
+
+def test_py_exits_with_the_script_exit_code(saved_instance, no_build, monkeypatch, tmp_path):
+    script = tmp_path / "fail.py"
+    script.write_text("raise SystemExit(5)")
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: 5)
+    assert invoke("py", "lab", str(script)).exit_code == 5
+
+
+def test_py_reports_a_missing_script(saved_instance, no_build):
+    result = invoke("py", "lab", "nope.py")
+    assert result.exit_code == 1 and "not a file" in result.output
+
+
+def test_tools_runs_a_command_in_the_tools_image(saved_instance, no_build, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("tools", "lab", "--", "jq", "--version").exit_code == 0
+    assert calls[0][-3:] == ["chlab/tools:test", "jq", "--version"]

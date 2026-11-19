@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import pytest
@@ -81,8 +80,7 @@ def test_meta_records_the_resolution(fake_deb: Path, cache: Cache):
 
 def test_cache_key_tracks_local_file_mutation(fake_binary: Path):
     before = cache_key(parse_source(str(fake_binary)))
-    time.sleep(1.1)  # mtime has one-second resolution
-    fake_binary.write_bytes(b"#!/bin/sh\necho rebuilt\n")
+    fake_binary.write_bytes(b"#!/bin/sh\necho rebuilt, with a different size\n")
     assert cache_key(parse_source(str(fake_binary))) != before
 
 

@@ -7,6 +7,7 @@ through here, and a local tool should not need a driver to run ``SELECT 1``.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -20,12 +21,29 @@ DEFAULT_TIMEOUT = 60
 DEFAULT_FORMAT = "JSONCompact"
 
 
-class QueryError(ChlabError):
-    """A query the server rejected, carrying the server's own message."""
+_ERROR_CODE = re.compile(r"\bCode:\s*(\d+)")
 
-    def __init__(self, message: str, *, node: str | None = None):
+
+class QueryError(ChlabError):
+    """A query the server rejected, carrying the server's own message and error code.
+
+    ``code`` is ClickHouse's numeric error code (``497`` for ACCESS_DENIED, ``60`` for
+    UNKNOWN_TABLE), or None when the failure never reached a server. Reproductions assert on
+    it, so it is exposed as a field rather than left buried in the message.
+    """
+
+    def __init__(self, message: str, *, node: str | None = None, code: int | None = None):
         super().__init__(message)
         self.node = node
+        self.code = code if code is not None else error_code(message)
+        self.query_id: str | None = None
+        self.events: dict[str, int] | None = None
+
+
+def error_code(message: str) -> int | None:
+    """The ClickHouse error code in a server message, if it carries one."""
+    match = _ERROR_CODE.search(message)
+    return int(match.group(1)) if match else None
 
 
 @dataclass
@@ -37,6 +55,9 @@ class QueryResult:
     elapsed: float = 0.0
     #: Set when the result came from a fan-out across nodes.
     node: str | None = None
+    query_id: str | None = None
+    #: ProfileEvents of the query, summed over every node that took part, when requested.
+    events: dict[str, int] | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -53,11 +74,14 @@ def execute(
     settings: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     node: str | None = None,
+    query_id: str | None = None,
 ) -> QueryResult:
     """Run ``sql`` against a node's HTTP port and return its result."""
     params: dict[str, str] = {"default_format": DEFAULT_FORMAT}
     if database:
         params["database"] = database
+    if query_id:
+        params["query_id"] = query_id
     params.update(settings or {})
 
     request = urllib.request.Request(
@@ -76,7 +100,12 @@ def execute(
             body = response.read().decode(errors="replace")
     except urllib.error.HTTPError as error:
         detail = _error_message(error.read().decode(errors="replace"))
-        raise QueryError(detail or f"HTTP {error.code} {error.reason}", node=node) from error
+        header = error.headers.get("X-ClickHouse-Exception-Code") if error.headers else None
+        raise QueryError(
+            detail or f"HTTP {error.code} {error.reason}",
+            node=node,
+            code=int(header) if header and header.isdigit() else None,
+        ) from error
     except urllib.error.URLError as error:
         raise QueryError(f"could not reach {url}: {error.reason}", node=node) from error
     except TimeoutError as error:

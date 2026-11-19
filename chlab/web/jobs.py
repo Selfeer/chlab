@@ -32,8 +32,7 @@ class Job:
             "kind": self.kind,
             "target": self.target,
             "status": self.status,
-            # A copy: the worker thread appends to this list under the lock, and the
-            # response is serialised outside it.
+            # A copy: the response is serialised outside the lock.
             "events": list(self.events),
             "error": self.error,
             "detail": self.detail,
@@ -73,6 +72,12 @@ class JobRunner:
     def get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def snapshot(self, job_id: str) -> dict | None:
+        """The job as JSON, read under the lock so its fields come from one moment."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job.to_dict() if job else None
 
     def prune(self, keep: int = 50) -> None:
         with self._lock:

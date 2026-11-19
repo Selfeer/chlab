@@ -99,7 +99,8 @@ def database_statement(name: str, engine: str = "Atomic") -> str:
     if engine == "Replicated":
         return (
             f"CREATE DATABASE IF NOT EXISTS {_ident(name)} "
-            f"ENGINE = Replicated('/clickhouse/databases/{name}', '{{shard}}', '{{replica}}')"
+            f"ENGINE = Replicated({_quote('/clickhouse/databases/' + name)}, "
+            "'{shard}', '{replica}')"
         )
     return f"CREATE DATABASE IF NOT EXISTS {_ident(name)}"
 
@@ -166,3 +167,7 @@ def _ident(name: str) -> str:
 
 def _quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+#: Public name for other modules that build SQL string literals.
+quote = _quote

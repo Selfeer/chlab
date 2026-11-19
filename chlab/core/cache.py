@@ -5,8 +5,8 @@
       bin/<key>/clickhouse            extracted, executable
       bin/<key>/meta.json             {source, version, resolved_at}
 
-The key is derived from the source string. For local paths the file's size and mtime are mixed
-in, so rebuilding a binary in place invalidates its entry instead of serving a stale version.
+The key is derived from the source string. For local paths the file's size and mtime (in nanoseconds)
+are mixed in, so rebuilding a binary in place invalidates its entry instead of serving a stale version.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def cache_key(source: Source) -> str:
     if source.kind is SourceKind.PATH:
         try:
             stat = Path(source.value).stat()
-            parts += [str(stat.st_size), str(int(stat.st_mtime))]
+            parts += [str(stat.st_size), str(stat.st_mtime_ns)]
         except OSError:
             # Missing file: resolution will fail with a better message than we can give here.
             pass

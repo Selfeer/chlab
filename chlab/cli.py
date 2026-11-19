@@ -7,10 +7,12 @@ import json as jsonlib
 import os
 import shutil
 from dataclasses import replace
+from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -21,6 +23,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from .core import confine
 from .core import profiles as profiles_module
 from .core.cache import Cache
 from .core.errors import ChlabError
@@ -29,10 +32,12 @@ from .core.registry import Registry
 from .core.resolve import Resolved, resolve
 from .core.runtime import InstanceStatus, Runtime
 from .core.spec import (
+    DEFAULT_BUCKET,
     ClusterSpec,
     SpecError,
     parse_database,
     parse_grant,
+    parse_s3_user,
     parse_setting,
     parse_user,
     suggest_name,
@@ -44,9 +49,28 @@ app = typer.Typer(
     add_completion=False,
 )
 cache_app = typer.Typer(help="Inspect and clear the artifact cache.", no_args_is_help=True)
+s3_app = typer.Typer(
+    help="Work with an instance's s3 service (started with --with s3). Paths are "
+    "BUCKET/KEY. Every command runs mc in a throwaway container and exits with its code.",
+    no_args_is_help=True,
+)
 profiles_app = typer.Typer(help="Saved cluster topologies.", no_args_is_help=True)
 app.add_typer(cache_app, name="cache")
 app.add_typer(profiles_app, name="profiles")
+app.add_typer(s3_app, name="s3")
+repro_app = typer.Typer(
+    help="Reproductions as directories: repro.yaml describes the cluster, numbered "
+    ".sql/.sh/.py/.chlab files are the steps. See `chlab repro init`.",
+    no_args_is_help=True,
+)
+app.add_typer(repro_app, name="repro")
+proxy_app = typer.Typer(
+    help="Inject faults between ClickHouse and object storage (started with --with "
+    "toxiproxy). They apply to reads through the s3_proxy named collections; `s3` stays "
+    "direct.",
+    no_args_is_help=True,
+)
+app.add_typer(proxy_app, name="proxy")
 
 console = Console()
 error_console = Console(stderr=True)
@@ -237,7 +261,41 @@ def up_command(
     ] = None,
     setting: Annotated[
         list[str] | None,
-        typer.Option("--setting", help="Server setting as key=value. Repeatable."),
+        typer.Option("--setting", help="Server setting (config.d) as key=value. Repeatable."),
+    ] = None,
+    query_setting: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--query-setting",
+            help="Query setting for every session, written into the default profile, as "
+            "key=value — e.g. allow_insert_into_iceberg=1. Repeatable.",
+        ),
+    ] = None,
+    with_service: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--with",
+            "-w",
+            help="Start a companion service next to the cluster: s3 (RustFS object storage), "
+            "iceberg-rest (Apache REST catalog), ice-rest (Altinity ice-rest-catalog), spark "
+            "(Spark SQL with Iceberg 1.9.1; needs a catalog), toxiproxy (fault injection in "
+            "front of s3). All but s3 need s3. Repeatable.",
+        ),
+    ] = None,
+    bucket: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--bucket",
+            help=f"Bucket to create in the s3 service (default: {DEFAULT_BUCKET}). Repeatable.",
+        ),
+    ] = None,
+    s3_user: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--s3-user",
+            help="Extra S3 identity: name:secret[:readwrite|readonly|writeonly[:bucket,bucket]]. "
+            "Secrets need 8+ characters. Repeatable.",
+        ),
     ] = None,
     seed: Annotated[
         bool | None,
@@ -283,6 +341,14 @@ def up_command(
             overrides["databases"] = tuple(parse_database(text) for text in database)
         if setting:
             overrides["settings"] = dict(parse_setting(text) for text in setting)
+        if query_setting:
+            overrides["profile_settings"] = dict(parse_setting(text) for text in query_setting)
+        if with_service:
+            overrides["services"] = tuple(dict.fromkeys(with_service))
+        if bucket:
+            overrides["buckets"] = tuple(bucket)
+        if s3_user:
+            overrides["s3_users"] = tuple(parse_s3_user(text) for text in s3_user)
 
         base = profiles_module.Profiles.default().get(profile) if profile else {}
         fields = profiles_module.apply(base, overrides)
@@ -413,42 +479,147 @@ def logs_command(
 @app.command("query")
 def query_command(
     name: NameArgument,
-    sql: Annotated[str, typer.Argument(help="SQL to run.")],
+    sql: Annotated[
+        str | None, typer.Argument(help="SQL to run: one statement. Use --file for several.")
+    ] = None,
+    file: Annotated[
+        str | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Run every statement in this file ('-' for stdin) through clickhouse-client "
+            "inside the node. Output is the client's own; stops at the first error.",
+        ),
+    ] = None,
     node: Annotated[str | None, typer.Option("--node", help="Run on this node.")] = None,
     all_nodes: Annotated[
         bool, typer.Option("--all", "-a", help="Run on every node and compare the results.")
     ] = False,
+    setting: Annotated[
+        list[str] | None,
+        typer.Option("--setting", "-s", help="Query setting as key=value. Repeatable."),
+    ] = None,
     user: Annotated[str, typer.Option("--user", "-u", help="ClickHouse user.")] = "default",
     password: Annotated[str, typer.Option("--password", help="ClickHouse password.")] = "",
     database: Annotated[str | None, typer.Option("--database", "-d")] = None,
+    output_format: Annotated[
+        str | None,
+        typer.Option("--format", help="With --file: the client's output format, e.g. TSV."),
+    ] = None,
+    events: Annotated[
+        str | None,
+        typer.Option(
+            "--events",
+            "-e",
+            metavar="REGEX",
+            help="Also report the query's ProfileEvents whose names match REGEX, summed over "
+            "every node that took part — e.g. 'S3GetObject|ReadBufferFromS3Bytes'. "
+            "'.' shows all.",
+        ),
+    ] = None,
     json: JsonOption = False,
 ) -> None:
-    """Run SQL against an instance."""
-    runtime = Runtime()
+    """Run SQL against an instance.
+
+    Exits 1 if the query fails on any node. With --json, failures are reported in the
+    output as {"node", "error", "code"}, where code is ClickHouse's error code.
+    """
     try:
-        if all_nodes:
-            results = runtime.query_all(name, sql, user=user, password=password, database=database)
-        else:
-            results = [
-                runtime.query(name, sql, node=node, user=user, password=password, database=database)
-            ]
+        settings = dict(parse_setting(text) for text in setting or [])
+        if (sql is None) == (file is None):
+            raise SpecError("give exactly one of SQL or --file")
     except ChlabError as failure:
         _fail(failure)
 
+    runtime = Runtime()
+    if file is not None:
+        if json:
+            _fail(SpecError("--json is not supported with --file; use --format JSONEachRow"))
+        if events is not None:
+            _fail(SpecError("--events is not supported with --file; run the statement alone"))
+        _run_sql_file(
+            runtime,
+            name,
+            file,
+            node=node,
+            all_nodes=all_nodes,
+            user=user,
+            password=password,
+            database=database,
+            settings=settings,
+            output_format=output_format,
+        )
+        return
+
+    options = {"user": user, "password": password, "database": database, "settings": settings}
+    if events is not None:
+        import uuid
+
+        options["query_id"] = f"chlab-{uuid.uuid4()}"
+    try:
+        if all_nodes:
+            results = runtime.query_all(name, sql, **options)
+        else:
+            try:
+                results = [runtime.query(name, sql, node=node, **options)]
+            except QueryError as failure:
+                results = [failure]
+        if events is not None:
+            for result in results:
+                if result.query_id:
+                    result.events = runtime.profile_events(name, result.query_id, events)
+    except ChlabError as failure:
+        _fail(failure)
+
+    failed = any(isinstance(result, QueryError) for result in results)
     if json:
         console.print_json(jsonlib.dumps([_result_as_dict(result) for result in results]))
-        return
+        raise typer.Exit(code=1 if failed else 0)
 
     for result in results:
         if isinstance(result, QueryError):
-            error_console.print(f"[bold red]{result.node}:[/bold red] {result}")
-            continue
-        if all_nodes:
-            console.print(f"[bold]{result.node}[/bold]")
-        _print_result(result)
+            label = f"{result.node}: " if result.node else ""
+            error_console.print(f"[bold red]{escape(label)}error:[/bold red] {escape(str(result))}")
+        else:
+            if all_nodes:
+                console.print(f"[bold]{result.node}[/bold]")
+            _print_result(result)
+        if result.events is not None:
+            _print_events(result.events)
 
     if all_nodes:
         console.print(_agreement_line(results))
+    raise typer.Exit(code=1 if failed else 0)
+
+
+def _run_sql_file(runtime: Runtime, name: str, file: str, *, node, all_nodes, **options) -> None:
+    import subprocess
+    import sys
+
+    try:
+        script = sys.stdin.read() if file == "-" else confine.local_path(file).read_text()
+    except ChlabError as failure:
+        _fail(failure)
+    except OSError as failure:
+        _fail(SpecError(f"could not read {file}: {failure.strerror or failure}"))
+
+    try:
+        nodes = list(runtime.status(name).topology.node_names) if all_nodes else [node]
+        commands = [
+            (target, runtime.client_script_command(name, node=target, **options))
+            for target in nodes
+        ]
+    except ChlabError as failure:
+        _fail(failure)
+
+    worst = 0
+    for target, command in commands:
+        if all_nodes:
+            console.print(f"[bold]{target}[/bold]")
+        # Streamed, not captured: the client's output is the result.
+        code = subprocess.run(command, input=script, text=True).returncode
+        worst = worst or code
+    raise typer.Exit(code=worst)
 
 
 @app.command("client")
@@ -466,6 +637,724 @@ def client_command(
         _fail(failure)
     # Hand the terminal over so the REPL behaves exactly as it would run directly.
     os.execvp(command[0], command)
+
+
+@app.command("exec")
+def exec_command(
+    name: NameArgument,
+    command: Annotated[
+        list[str] | None,
+        typer.Argument(help="Command to run. Put it after `--`. Defaults to bash."),
+    ] = None,
+    node: Annotated[
+        str | None,
+        typer.Option("--node", help="Node or keeper to run in. Defaults to the first node."),
+    ] = None,
+) -> None:
+    """Run a command inside a node's container, e.g. `chlab exec lab -- ls /var/lib/clickhouse`.
+
+    Exits with the command's own exit code. Stdin is passed through, and a terminal is
+    allocated only when there is one, so this works the same from scripts and by hand.
+    """
+    import subprocess
+    import sys
+
+    interactive_terminal = sys.stdin.isatty() and sys.stdout.isatty()
+    try:
+        docker_command = Runtime().exec_command(
+            name,
+            command or ["bash"],
+            service=node,
+            interactive=True,
+            tty=interactive_terminal,
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
+
+
+@app.command("cp")
+def cp_command(
+    source: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
+    destination: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
+) -> None:
+    """Copy files into or out of a node, like `docker cp`.
+
+    One side names the instance: `lab:/var/lib/clickhouse/user_files/x.parquet` is the first
+    node, `lab/clickhouse2:/tmp` a specific one. Directories are copied recursively.
+    """
+    import subprocess
+
+    runtime = Runtime()
+    try:
+        remote_source = _remote_path(source, runtime.registry)
+        remote_destination = _remote_path(destination, runtime.registry)
+        if (remote_source is None) == (remote_destination is None):
+            raise SpecError(
+                "exactly one side of `chlab cp` must be NAME[/NODE]:PATH, the other a local path"
+            )
+        to_container = remote_destination is not None
+        instance, node, container_path = remote_destination or remote_source
+        docker_command = runtime.copy_command(
+            instance,
+            service=node,
+            container_path=container_path,
+            host_path=_host_side(source if to_container else destination),
+            to_container=to_container,
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
+
+
+def _host_side(text: str) -> str:
+    # Checked, but passed on as written: docker cp gives a trailing / meaning. `-` is its
+    # tar stream on stdin/stdout, not a file.
+    if text != "-":
+        confine.local_path(text)
+    return text
+
+
+def _remote_path(text: str, registry: Registry) -> tuple[str, str | None, str] | None:
+    """Parse NAME[/NODE]:PATH, or return None for a local path."""
+    prefix, separator, path = text.partition(":")
+    if not separator:
+        return None
+    instance, _, node = prefix.partition("/")
+    if not registry.exists(instance):
+        # A local path that happens to contain a colon, unless it looks like ours.
+        if "/" in instance or not instance:
+            return None
+        raise SpecError(f"no instance named {instance!r} (in {text!r})")
+    return instance, node or None, path or "/"
+
+
+@app.command("restart")
+def restart_command(
+    name: NameArgument,
+    node: Annotated[
+        list[str] | None,
+        typer.Option("--node", help="Restart only this node or keeper. Repeatable."),
+    ] = None,
+) -> None:
+    """Restart an instance's services and wait until they are ready again."""
+    runtime = Runtime()
+    with _spinner("restarting") as report:
+        try:
+            status = runtime.restart(name, node or (), on_event=report.event)
+        except ChlabError as failure:
+            _fail(failure)
+    console.print(f"restarted {', '.join(node) if node else name}: {status.state}")
+
+
+@app.command("env")
+def env_command(name: NameArgument, json: JsonOption = False) -> None:
+    """Endpoints, containers and credentials of an instance, from the host and the network."""
+    from .core.environment import describe
+
+    runtime = Runtime()
+    try:
+        info = describe(runtime.status(name), runtime.registry)
+    except ChlabError as failure:
+        _fail(failure)
+
+    if json:
+        console.print_json(jsonlib.dumps(info))
+        return
+
+    header = _kv_table()
+    for key in ("name", "state", "version", "cluster", "compose_project", "network", "directory"):
+        header.add_row(key, str(info[key] or "unknown"))
+    console.print(header)
+    console.print()
+
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    for column in ("SERVICE", "CONTAINER", "FROM HOST", "IN NETWORK"):
+        table.add_column(column, overflow="fold")
+    for node in info["nodes"]:
+        table.add_row(
+            node["name"], node["container"], node["host"]["http"], node["network"]["http"]
+        )
+        table.add_row("", "", node["host"]["native"], node["network"]["native"])
+    for keeper in info["keepers"]:
+        table.add_row(keeper["name"], keeper["container"], keeper["host"], keeper["network"])
+    for service_name, service in info["services"].items():
+        table.add_row(
+            service_name,
+            service["container"],
+            service["host"]["endpoint"],
+            service["network"].get("clickhouse") or service["network"]["endpoint"],
+        )
+    console.print(table)
+    console.print()
+
+    for service_name, service in info["services"].items():
+        snippets = _kv_table()
+        for label, sql in service.get("sql", {}).items():
+            snippets.add_row(f"{service_name} {label}", sql)
+        console.print(snippets)
+    if info["services"]:
+        console.print()
+
+    users = _kv_table()
+    for user in info["users"]:
+        users.add_row(user["name"], f"password={user['password']!r} role={user['role']}")
+    console.print(users)
+
+
+# --- tools container ---------------------------------------------------------------------
+
+
+@app.command("py", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def py_command(
+    ctx: typer.Context,
+    name: NameArgument,
+    script: Annotated[str, typer.Argument(help="Python script to run, or '-' for stdin.")],
+) -> None:
+    """Run a Python script in the tools container, wired to the instance.
+
+    pyiceberg, pyarrow and boto3 are installed; catalogs, S3 and the ClickHouse nodes are
+    configured through the environment, and `import chlab_tools` gives shortcuts:
+    catalog(), s3(), query(sql), rows(sql), BUCKET, NODES. The current directory is
+    mounted at /work (the working directory), so the script reads and writes local files.
+    Arguments after the script are passed to it. Exits with the script's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.image import ensure_tools_image
+    from .core.tools import tools_command
+
+    try:
+        spec = Registry().load(name)
+        if script == "-":
+            command, mounts, stdin = ["python", "-", *ctx.args], [], True
+        else:
+            path = confine.local_path(script)
+            if not path.is_file():
+                raise SpecError(f"{script} is not a file")
+            target = f"/chlab/run/{path.name}"
+            command, mounts, stdin = ["python", target, *ctx.args], [(str(path), target)], False
+        image = ensure_tools_image()
+        docker_command = tools_command(
+            spec, command, image=image, workdir=Path.cwd(), mounts=mounts, interactive=stdin
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command, stdin=sys.stdin if stdin else None))
+
+
+@app.command("tools")
+def tools_shell_command(
+    name: NameArgument,
+    command: Annotated[
+        list[str] | None,
+        typer.Argument(help="Command to run, after `--`. Defaults to bash."),
+    ] = None,
+) -> None:
+    """Run any command in the tools container: jq, mc, curl, python, aws-style boto3 scripts.
+
+    Same environment and /work mount as `chlab py`. Exits with the command's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.image import ensure_tools_image
+    from .core.tools import tools_command
+
+    try:
+        spec = Registry().load(name)
+        image = ensure_tools_image()
+        docker_command = tools_command(
+            spec,
+            command or ["bash"],
+            image=image,
+            workdir=Path.cwd(),
+            interactive=True,
+            tty=sys.stdin.isatty() and sys.stdout.isatty(),
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
+
+
+# --- spark -------------------------------------------------------------------------------
+
+
+@app.command("spark")
+def spark_command(
+    name: NameArgument,
+    sql: Annotated[str | None, typer.Argument(help="Spark SQL statements, ';'-separated.")] = None,
+    file: Annotated[
+        str | None,
+        typer.Option("--file", "-f", help="Run the statements in this file ('-': stdin)."),
+    ] = None,
+) -> None:
+    """Run Spark SQL against the instance's Iceberg catalogs (started with --with spark).
+
+    Catalogs are named as in pyiceberg — `rest` for iceberg-rest, `ice` for ice-rest — and
+    the first is the default. Each call starts a JVM (20-40s), so batch statements.
+    Exits with spark-sql's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.services.spark import spark_sql_command
+
+    try:
+        spec = Registry().load(name)
+        if not spec.has_service("spark"):
+            raise SpecError(f"{name} has no spark service; launch it with --with spark")
+        if (sql is None) == (file is None):
+            raise SpecError("give exactly one of SQL or --file")
+        if file == "-":
+            statements = sys.stdin.read()
+        elif file is not None:
+            statements = confine.local_path(file).read_text()
+        else:
+            statements = sql
+    except OSError as failure:
+        _fail(SpecError(f"could not read {file}: {failure.strerror or failure}"))
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(
+        code=subprocess.run(spark_sql_command(spec), input=statements, text=True).returncode
+    )
+
+
+# --- proxy -------------------------------------------------------------------------------
+
+
+def _proxy(name: str):
+    from .core.topology import build_topology
+
+    spec = Registry().load(name)
+    node = build_topology(spec).companion("toxiproxy")
+    if node is None:
+        raise SpecError(f"{name} has no toxiproxy service; launch it with --with toxiproxy")
+    return node
+
+
+def _proxy_action(name: str, action, message: str) -> None:
+    try:
+        action(_proxy(name))
+    except ChlabError as failure:
+        _fail(failure)
+    console.print(message)
+
+
+UpstreamOption = Annotated[
+    bool,
+    typer.Option("--upstream", help="Apply to requests (ClickHouse to S3) instead of responses."),
+]
+
+
+@proxy_app.command("status")
+def proxy_status(name: NameArgument, json: JsonOption = False) -> None:
+    """Show whether the proxy is up and which faults are active."""
+    from .core.services import toxiproxy
+
+    try:
+        info = toxiproxy.status(_proxy(name))
+    except ChlabError as failure:
+        _fail(failure)
+    if json:
+        console.print_json(jsonlib.dumps(info))
+        return
+    console.print(f"{'enabled' if info['enabled'] else '[red]disabled[/red]'}: {info['upstream']}")
+    for toxic in info["toxics"]:
+        details = ", ".join(
+            f"{k}={v}" for k, v in toxic.items() if k not in {"name", "type", "stream"}
+        )
+        console.print(f"  {toxic['type']} ({toxic['stream']}): {details}")
+    if not info["toxics"]:
+        console.print("[dim]  no faults[/dim]")
+
+
+@proxy_app.command("latency")
+def proxy_latency(
+    name: NameArgument,
+    milliseconds: Annotated[int, typer.Argument(help="Delay added to every response.")],
+    jitter: Annotated[int, typer.Option("--jitter", help="Random +/- milliseconds.")] = 0,
+    upstream: UpstreamOption = False,
+) -> None:
+    """Add latency, e.g. to see what one GET per bloom filter costs on real storage."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(
+            node, "latency", milliseconds, jitter=jitter, upstream=upstream
+        ),
+        f"latency {milliseconds}ms" + (f" +/- {jitter}ms" if jitter else ""),
+    )
+
+
+@proxy_app.command("bandwidth")
+def proxy_bandwidth(
+    name: NameArgument,
+    kilobytes_per_second: Annotated[int, typer.Argument(help="Throughput limit, KB/s.")],
+    upstream: UpstreamOption = False,
+) -> None:
+    """Limit throughput."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(
+            node, "bandwidth", kilobytes_per_second, upstream=upstream
+        ),
+        f"bandwidth {kilobytes_per_second} KB/s",
+    )
+
+
+@proxy_app.command("timeout")
+def proxy_timeout(
+    name: NameArgument,
+    milliseconds: Annotated[
+        int, typer.Argument(help="Close connections after this long; 0 holds them forever.")
+    ],
+    upstream: UpstreamOption = False,
+) -> None:
+    """Stop all data, as a storage server that hangs mid-request."""
+    from .core.services import toxiproxy
+
+    _proxy_action(
+        name,
+        lambda node: toxiproxy.set_toxic(node, "timeout", milliseconds, upstream=upstream),
+        f"timeout after {milliseconds}ms",
+    )
+
+
+@proxy_app.command("down")
+def proxy_down(name: NameArgument) -> None:
+    """Refuse every connection, as storage that is gone."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, lambda node: toxiproxy.set_enabled(node, False), "proxy down")
+
+
+@proxy_app.command("up")
+def proxy_up(name: NameArgument) -> None:
+    """Accept connections again, keeping any faults."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, lambda node: toxiproxy.set_enabled(node, True), "proxy up")
+
+
+@proxy_app.command("reset")
+def proxy_reset(name: NameArgument) -> None:
+    """Remove every fault and bring the proxy up."""
+    from .core.services import toxiproxy
+
+    _proxy_action(name, toxiproxy.reset, "proxy reset: no faults")
+
+
+# --- repro -------------------------------------------------------------------------------
+
+
+@repro_app.command("init")
+def repro_init(
+    directory: Annotated[Path, typer.Argument(help="Directory to create.")],
+    title: Annotated[str | None, typer.Option("--title", help="One-line description.")] = None,
+    with_service: Annotated[
+        list[str] | None, typer.Option("--with", "-w", help="Service to include. Repeatable.")
+    ] = None,
+) -> None:
+    """Create a reproduction skeleton: repro.yaml and a first step."""
+    from .core import repro
+
+    try:
+        repro.init(directory, title=title, services=with_service)
+    except ChlabError as failure:
+        _fail(failure)
+    console.print(f"created {directory / repro.REPRO_FILE} and {directory / '01-setup.sql'}")
+
+
+@repro_app.command("check")
+def repro_check(
+    directory: Annotated[Path, typer.Argument(help="Reproduction directory.")],
+    json: JsonOption = False,
+) -> None:
+    """Validate a reproduction without running it: repro.yaml, steps, directives."""
+    from .core import repro
+
+    try:
+        loaded = repro.load(directory)
+    except ChlabError as failure:
+        _fail(failure)
+
+    steps = [
+        {
+            "step": step.name,
+            "kind": step.kind,
+            "where": step.where,
+            "expect": step.expect.describe(),
+        }
+        for step in loaded.steps
+    ]
+    if json:
+        console.print_json(jsonlib.dumps({"title": loaded.title, "steps": steps}))
+        return
+    console.print(f"[bold]{escape(loaded.title)}[/bold]")
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    for column in ("STEP", "RUNS ON", "EXPECTS"):
+        table.add_column(column)
+    for step in steps:
+        table.add_row(step["step"], step["where"], step["expect"])
+    console.print(table)
+
+
+@repro_app.command("run")
+def repro_run(
+    directory: Annotated[Path, typer.Argument(help="Reproduction directory.")],
+    clickhouse: Annotated[
+        str | None,
+        typer.Option("--clickhouse", "-c", help="Build to run on. Defaults to repro.yaml's."),
+    ] = None,
+    compare: Annotated[
+        str | None,
+        typer.Option(
+            "--compare",
+            help="Also run on this build and report the steps where the two behave differently.",
+        ),
+    ] = None,
+    no_compare: Annotated[
+        bool, typer.Option("--no-compare", help="Ignore compare: in repro.yaml.")
+    ] = False,
+    keep: Annotated[
+        bool, typer.Option("--keep", help="Leave the instances running for inspection.")
+    ] = False,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Where to write result.json and report.md. "
+            "Default: <directory>/results/<timestamp>.",
+        ),
+    ] = None,
+    json: Annotated[bool, typer.Option("--json", help="Print result.json to stdout.")] = False,
+) -> None:
+    """Run a reproduction on fresh instances, then remove them.
+
+    Exits 0 when every step met its expectation on every build, 1 when any step did not —
+    expectations describe correct behaviour, so 1 usually means the bug reproduced — and 2
+    when a cluster could not be launched.
+    """
+    from .core import repro
+
+    try:
+        loaded = repro.load(directory)
+        primary = clickhouse or loaded.clickhouse
+        if not primary:
+            raise SpecError("give the build with -c, or set clickhouse: in repro.yaml")
+        sources = [primary]
+        second = compare or (None if no_compare else loaded.compare)
+        if second:
+            sources.append(second)
+    except ChlabError as failure:
+        _fail(failure)
+
+    events = error_console if json else console
+    with _spinner("starting") as report:
+
+        def notify(message: str) -> None:
+            report.event(message)
+            if message.endswith(("passed", "FAILED")):
+                colour = "green" if message.endswith("passed") else "red"
+                events.print(f"[{colour}]{escape(message)}[/{colour}]")
+
+        untrusted = [source for source in sources if source not in (clickhouse, compare)]
+        run = repro.Runner(on_event=notify).run(loaded, sources, keep=keep, untrusted=untrusted)
+
+    try:
+        destination = repro.write_results(run, loaded.directory, out)
+    except (ChlabError, OSError) as failure:
+        _fail(failure)
+
+    if json:
+        console.print_json(jsonlib.dumps(run.to_dict()))
+    else:
+        console.print()
+        for build in run.builds:
+            if build.error:
+                verdict = "[red]launch failed[/red]"
+            else:
+                verdict = "[green]passed[/green]" if build.passed else "[red]failed[/red]"
+            kept = f" (kept as {build.instance})" if build.kept else ""
+            console.print(f"{escape(build.source)} ({build.version or '?'}): {verdict}{kept}")
+            if build.error:
+                error_console.print(escape(build.error.strip()))
+        if len(run.builds) == 2 and run.launched:
+            console.print(
+                "builds differ at: " + ", ".join(run.differences)
+                if run.differences
+                else "both builds behaved identically"
+            )
+        console.print(f"[dim]{destination / 'report.md'}[/dim]")
+
+    if not run.launched:
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=0 if run.passed else 1)
+
+
+# --- s3 ----------------------------------------------------------------------------------
+
+AsUserOption = Annotated[
+    str | None,
+    typer.Option("--as", help="Act as this S3 user (from --s3-user) instead of the root user."),
+]
+
+
+def _s3_spec(name: str) -> ClusterSpec:
+    spec = Registry().load(name)
+    if not spec.has_service("s3"):
+        raise SpecError(f"{name} has no s3 service; launch it with --with s3")
+    return spec
+
+
+def _run_mc(name: str, args: list[str], *, as_user=None, mounts=(), stdin=False) -> NoReturn:
+    import subprocess
+
+    from .core.services import s3
+
+    try:
+        command = s3.mc_command(
+            _s3_spec(name), args, as_user=as_user, mounts=mounts, interactive=stdin
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(command))
+
+
+@s3_app.command("ls")
+def s3_ls(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET[/PREFIX]. Omit for all buckets.")] = "",
+    recursive: Annotated[bool, typer.Option("--recursive", "-r")] = False,
+    json: Annotated[bool, typer.Option("--json", help="mc's JSON lines output.")] = False,
+    as_user: AsUserOption = None,
+) -> None:
+    """List buckets or objects."""
+    from .core.services.s3 import object_path
+
+    args = ["ls", *(["--recursive"] if recursive else []), *(["--json"] if json else [])]
+    _run_mc(name, [*args, object_path(path)], as_user=as_user)
+
+
+@s3_app.command("put")
+def s3_put(
+    name: NameArgument,
+    paths: Annotated[
+        list[str], typer.Argument(help="Local files or directories, then BUCKET/KEY last.")
+    ],
+    as_user: AsUserOption = None,
+) -> None:
+    """Upload files or directories: `chlab s3 put lab ./a.parquet ./dir warehouse/data/`.
+
+    As with cp, a destination ending in / is a prefix to copy into.
+    """
+    from .core.services.s3 import object_path
+
+    if len(paths) < 2:
+        _fail(SpecError("give at least one local path and a BUCKET/KEY destination"))
+    *sources, destination = paths
+    mounts, inside = [], []
+    for index, source in enumerate(sources):
+        try:
+            local = confine.local_path(source)
+        except ChlabError as failure:
+            _fail(failure)
+        if not local.exists():
+            _fail(SpecError(f"{source} does not exist"))
+        target = f"/chlab-in/{index}/{local.resolve().name}"
+        mounts.append((str(local.resolve()), target, True))
+        inside.append(target)
+    _run_mc(
+        name,
+        ["cp", "--recursive", *inside, object_path(destination)],
+        as_user=as_user,
+        mounts=mounts,
+    )
+
+
+@s3_app.command("get")
+def s3_get(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY or BUCKET/PREFIX/.")],
+    destination: Annotated[str, typer.Argument(help="Local file or existing directory.")] = ".",
+    as_user: AsUserOption = None,
+) -> None:
+    """Download an object, or a prefix recursively."""
+    from .core.services.s3 import object_path
+
+    try:
+        local = confine.local_path(destination)
+    except ChlabError as failure:
+        _fail(failure)
+    if local.is_dir():
+        mount, target = local, "/chlab-out/"
+    else:
+        if not local.parent.is_dir():
+            _fail(SpecError(f"{local.parent} does not exist"))
+        mount, target = local.parent, f"/chlab-out/{local.name}"
+    _run_mc(
+        name,
+        ["cp", "--recursive", object_path(path), target],
+        as_user=as_user,
+        mounts=[(str(mount), "/chlab-out", False)],
+    )
+
+
+@s3_app.command("cat")
+def s3_cat(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Print an object, e.g. an Iceberg metadata.json."""
+    from .core.services.s3 import object_path
+
+    _run_mc(name, ["cat", object_path(path)], as_user=as_user)
+
+
+@s3_app.command("rm")
+def s3_rm(
+    name: NameArgument,
+    path: Annotated[str, typer.Argument(help="BUCKET/KEY, or a prefix with --recursive.")],
+    recursive: Annotated[bool, typer.Option("--recursive", "-r")] = False,
+    as_user: AsUserOption = None,
+) -> None:
+    """Delete an object, or everything under a prefix."""
+    from .core.services.s3 import object_path
+
+    args = ["rm", *(["--recursive", "--force"] if recursive else []), object_path(path)]
+    _run_mc(name, args, as_user=as_user)
+
+
+@s3_app.command("mb")
+def s3_mb(
+    name: NameArgument,
+    bucket: Annotated[str, typer.Argument(help="Bucket to create.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Create a bucket after launch (or use --bucket at `chlab up`)."""
+    from .core.services.s3 import object_path
+
+    _run_mc(name, ["mb", "--ignore-existing", object_path(bucket)], as_user=as_user)
+
+
+@s3_app.command("mc")
+def s3_mc(
+    name: NameArgument,
+    args: Annotated[list[str], typer.Argument(help="mc arguments, after `--`. The alias is `s3`.")],
+    as_user: AsUserOption = None,
+) -> None:
+    """Run any mc command against the instance: `chlab s3 mc lab -- stat s3/warehouse/x`.
+
+    Stdin is passed through, so `... -- pipe s3/warehouse/key < file` works.
+    """
+    _run_mc(name, list(args), as_user=as_user, stdin=True)
 
 
 # --- profiles ----------------------------------------------------------------------------
@@ -522,7 +1411,9 @@ def profiles_rm(profile_name: Annotated[str, typer.Argument(help="Profile to del
 @app.command("ui")
 def ui_command(
     port: Annotated[int, typer.Option("--port", help="Port to serve on.")] = 7777,
-    host: Annotated[str, typer.Option("--host", help="Address to bind.")] = "127.0.0.1",
+    host: Annotated[
+        str, typer.Option("--host", help="Loopback address to bind: 127.0.0.1, localhost or ::1.")
+    ] = "127.0.0.1",
     open_browser: Annotated[
         bool, typer.Option("--open/--no-open", help="Open a browser window.")
     ] = True,
@@ -534,9 +1425,14 @@ def ui_command(
 
     url = f"http://{host}:{port}"
     if host not in {"127.0.0.1", "localhost", "::1"}:
-        error_console.print(
-            f"[bold yellow]warning:[/bold yellow] binding to {host} exposes an unauthenticated "
-            "API that runs SQL and deletes clusters to everyone who can reach this machine."
+        # The API is unauthenticated, runs SQL, deletes clusters and returns saved profiles
+        # with their passwords; it answers only on loopback names in any case.
+        _fail(
+            SpecError(
+                f"chlab ui serves only on loopback, not {host}: its API has no "
+                "authentication. To reach it from another machine, forward the port: "
+                f"ssh -L {port}:127.0.0.1:{port} <this host>"
+            )
         )
     console.print(f"chlab ui on [bold]{url}[/bold]")
     if open_browser:
@@ -636,6 +1532,11 @@ def _print_instance(status: InstanceStatus) -> None:
         )
     for keeper in status.topology.keepers:
         table.add_row(keeper.name, "-", "-", f"127.0.0.1:{keeper.client_port}", "-", "-")
+    from .core import services as companions
+
+    for service, endpoint in companions.active(status.topology):
+        host = service.describe(status.topology, endpoint).get("host", {}).get("endpoint", "-")
+        table.add_row(service.name, "-", "-", host, "-", "-")
     console.print(table)
 
 
@@ -653,6 +1554,18 @@ def _print_result(result: QueryResult) -> None:
     console.print(
         f"[dim]{len(result.rows)} row(s), {result.rows_read} read in {result.elapsed:.3f}s[/dim]"
     )
+
+
+def _print_events(events: dict[str, int]) -> None:
+    if not events:
+        console.print("[dim]no matching ProfileEvents[/dim]")
+        return
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    table.add_column("EVENT", style="bold")
+    table.add_column("VALUE", justify="right")
+    for event, value in events.items():
+        table.add_row(event, str(value))
+    console.print(table)
 
 
 def _agreement_line(results: list) -> str:
@@ -675,6 +1588,8 @@ def _topology_summary(status: InstanceStatus) -> str:
     summary = f"{spec.shards}x{spec.replicas} ({spec.node_count} node{'s' if spec.node_count > 1 else ''})"
     if status.topology.keepers:
         summary += f" + {len(status.topology.keepers)} keeper"
+    for service in status.topology.services:
+        summary += f" + {service.name}"
     return summary
 
 
@@ -791,19 +1706,25 @@ def _status_as_dict(status: InstanceStatus) -> dict:
 
 def _result_as_dict(result) -> dict:
     if isinstance(result, QueryError):
-        return {"node": result.node, "error": str(result)}
-    return {
-        "node": result.node,
-        "columns": result.columns,
-        "types": result.types,
-        "rows": result.rows,
-        "rows_read": result.rows_read,
-        "elapsed": result.elapsed,
-    }
+        payload = {"node": result.node, "error": str(result), "code": result.code}
+    else:
+        payload = {
+            "node": result.node,
+            "columns": result.columns,
+            "types": result.types,
+            "rows": result.rows,
+            "rows_read": result.rows_read,
+            "elapsed": result.elapsed,
+        }
+    if result.query_id:
+        payload["query_id"] = result.query_id
+    if result.events is not None:
+        payload["events"] = result.events
+    return payload
 
 
 def _fail(failure: Exception) -> NoReturn:
-    error_console.print(f"[bold red]error:[/bold red] {failure}")
+    error_console.print(f"[bold red]error:[/bold red] {escape(str(failure))}")
     raise typer.Exit(code=1)
 
 

@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from . import services as companions
 from .spec import ClusterSpec
 from .topology import (
     CONTAINER_HTTP_PORT,
@@ -40,6 +41,11 @@ def write_configs(topology: Topology, root: Path, *, base_image_mode: bool) -> N
         _write_node_configs(topology, node, configs / node.name, base_image_mode=base_image_mode)
     for keeper in topology.keepers:
         _write_keeper_configs(topology, keeper, configs / keeper.name)
+    for service, _endpoint in companions.active(topology):
+        for relative, content in service.files(topology).items():
+            path = root / "services" / service.name / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
 
 
 def _write_node_configs(
@@ -64,9 +70,18 @@ def _write_node_configs(
     if topology.spec.settings:
         _write_xml(config_d / "50-chlab-settings.xml", server_settings(topology.spec.settings))
 
+    for service, _endpoint in companions.active(topology):
+        for filename, document in service.node_configs(topology).items():
+            _write_xml(config_d / filename, document)
+
     # The declared users are created as SQL objects after start; this only makes sure the
     # default user is allowed to create them.
     _write_xml(users_d / "10-chlab-default.xml", default_user_access_management())
+
+    if topology.spec.profile_settings:
+        _write_xml(
+            users_d / "20-chlab-profile.xml", profile_settings(topology.spec.profile_settings)
+        )
 
 
 def _write_keeper_configs(topology: Topology, keeper: KeeperNode, keeper_dir: Path) -> None:
@@ -113,6 +128,13 @@ def base_config() -> dict[str, Any]:
         "max_connections": 1024,
         "max_concurrent_queries": 100,
         "keep_alive_timeout": 3,
+        # Stock images ship this; a bare binary has no query log unless asked. Reproductions
+        # read ProfileEvents from it (S3 GETs per query, bytes read), so it must exist.
+        "query_log": {
+            "database": "system",
+            "table": "query_log",
+            "flush_interval_milliseconds": 7500,
+        },
     }
 
 
@@ -186,6 +208,15 @@ def console_logging() -> dict[str, Any]:
 
 def server_settings(settings: dict[str, str]) -> dict[str, Any]:
     return dict(settings)
+
+
+def profile_settings(settings: dict[str, str]) -> dict[str, Any]:
+    """Query settings for every session, via the ``default`` profile.
+
+    SQL-created users inherit ``default_profile`` too, so this reaches them without a
+    per-user ``SETTINGS PROFILE`` clause.
+    """
+    return {"profiles": {"default": dict(settings)}}
 
 
 def keeper_config(keeper: KeeperNode, keepers: tuple[KeeperNode, ...]) -> dict[str, Any]:

@@ -16,6 +16,7 @@ import os
 import shutil
 from pathlib import Path
 
+from . import confine
 from .errors import ChlabError
 from .spec import ClusterSpec
 from .topology import port_span
@@ -62,6 +63,9 @@ class Registry:
         return self.root / "instances"
 
     def instance_dir(self, name: str) -> Path:
+        # Every lookup by name comes through here, so this is where a reproduction step's
+        # child CLI is held to its own instance.
+        confine.check_instance(name)
         return self.instances_dir / name
 
     def exists(self, name: str) -> bool:
@@ -97,6 +101,8 @@ class Registry:
             return []
         specs = []
         for directory in sorted(self.instances_dir.iterdir()):
+            if not confine.instance_allowed(directory.name):
+                continue
             try:
                 specs.append(self.load(directory.name))
             except (ChlabError, json.JSONDecodeError, TypeError, ValueError):

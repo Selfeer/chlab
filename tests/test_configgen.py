@@ -131,3 +131,18 @@ def test_custom_settings_are_written(tmp_path: Path):
     )
     path = tmp_path / "configs" / "clickhouse1" / "config.d" / "50-chlab-settings.xml"
     assert "max_server_memory_usage" in path.read_text()
+
+
+def test_profile_settings_go_into_the_default_profile(tmp_path: Path):
+    configgen.write_configs(
+        topology(profile_settings={"allow_insert_into_iceberg": "1"}),
+        tmp_path,
+        base_image_mode=False,
+    )
+    root = ET.parse(tmp_path / "configs/clickhouse1/users.d/20-chlab-profile.xml").getroot()
+    assert root.findtext("profiles/default/allow_insert_into_iceberg") == "1"
+
+
+def test_no_profile_file_without_profile_settings(tmp_path: Path):
+    configgen.write_configs(topology(), tmp_path, base_image_mode=False)
+    assert not (tmp_path / "configs/clickhouse1/users.d/20-chlab-profile.xml").exists()

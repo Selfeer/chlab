@@ -14,11 +14,14 @@ from chlab.core.query import QueryError, execute, ping
 class _Handler(http.server.BaseHTTPRequestHandler):
     #: Set per test: (status, body).
     response = (200, "")
+    extra_headers: dict[str, str] = {}
 
     def do_POST(self):
         status, body = self.response
         payload = body.encode()
         self.send_response(status)
+        for key, value in self.extra_headers.items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -130,3 +133,26 @@ def test_ping_is_true_when_the_server_answers(server):
     handler, url = server
     handler.response = (200, "Ok.\n")
     assert ping(url) is True
+
+
+def test_server_errors_carry_the_clickhouse_error_code(server):
+    handler, url = server
+    handler.response = (404, "Code: 60. DB::Exception: Unknown table expression identifier")
+    with pytest.raises(QueryError) as failure:
+        execute(url, "SELECT * FROM nope")
+    assert failure.value.code == 60
+
+
+def test_the_exception_code_header_wins_over_the_message(server):
+    handler, url = server
+    handler.extra_headers = {"X-ClickHouse-Exception-Code": "497"}
+    handler.response = (500, "something without a code in it")
+    with pytest.raises(QueryError) as failure:
+        execute(url, "SELECT 1")
+    assert failure.value.code == 497
+
+
+def test_unreachable_nodes_have_no_error_code():
+    with pytest.raises(QueryError) as failure:
+        execute("http://127.0.0.1:1", "SELECT 1", timeout=1)
+    assert failure.value.code is None

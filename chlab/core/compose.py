@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from . import services as companions
 from .resolve import Resolved
 from .topology import (
     CONTAINER_HTTP_PORT,
@@ -40,6 +41,11 @@ def render(topology: Topology, resolved: Resolved, root: Path, image: str) -> di
     for node in topology.nodes:
         services[node.name] = _node_service(node, topology, resolved, root, image, project)
         volumes[_volume_name(node.name)] = None
+
+    for service, endpoint in companions.active(topology):
+        services[service.name] = service.compose_service(topology, endpoint, root)
+        for volume in service.volumes():
+            volumes[volume] = None
 
     return {"services": services, "volumes": volumes}
 
