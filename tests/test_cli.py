@@ -656,3 +656,23 @@ def test_tools_runs_a_command_in_the_tools_image(saved_instance, no_build, monke
     calls = capture_call(monkeypatch)
     assert invoke("tools", "lab", "--", "jq", "--version").exit_code == 0
     assert calls[0][-3:] == ["chlab/tools:test", "jq", "--version"]
+
+
+def _command_paths(command, prefix=()):
+    # Typer vendors its own click, so test for a group by shape rather than by class.
+    if hasattr(command, "commands"):
+        for name, sub in command.commands.items():
+            yield from _command_paths(sub, (*prefix, name))
+    else:
+        yield prefix
+
+
+def test_every_help_page_renders():
+    """Help text is Rich markup: a literal `[/NODE]` reads as a closing tag and crashes."""
+    import typer
+
+    paths = list(_command_paths(typer.main.get_command(app)))
+    assert len(paths) > 40
+    for path in paths:
+        result = invoke(*path, "--help")
+        assert result.exit_code == 0, (path, result.output, result.exception)

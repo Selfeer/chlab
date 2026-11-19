@@ -675,8 +675,8 @@ def exec_command(
 
 @app.command("cp")
 def cp_command(
-    source: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
-    destination: Annotated[str, typer.Argument(help="NAME[/NODE]:PATH or a local path.")],
+    source: Annotated[str, typer.Argument(help="NAME\\[/NODE]:PATH or a local path.")],
+    destination: Annotated[str, typer.Argument(help="NAME\\[/NODE]:PATH or a local path.")],
 ) -> None:
     """Copy files into or out of a node, like `docker cp`.
 
@@ -1230,7 +1230,7 @@ def _run_mc(name: str, args: list[str], *, as_user=None, mounts=(), stdin=False)
 @s3_app.command("ls")
 def s3_ls(
     name: NameArgument,
-    path: Annotated[str, typer.Argument(help="BUCKET[/PREFIX]. Omit for all buckets.")] = "",
+    path: Annotated[str, typer.Argument(help="BUCKET\\[/PREFIX]. Omit for all buckets.")] = "",
     recursive: Annotated[bool, typer.Option("--recursive", "-r")] = False,
     json: Annotated[bool, typer.Option("--json", help="mc's JSON lines output.")] = False,
     as_user: AsUserOption = None,
