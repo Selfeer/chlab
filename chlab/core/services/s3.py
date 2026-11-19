@@ -17,16 +17,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from ..errors import ChlabError
 from ..events import EventCallback
+from ..image import MC_IMAGE
 from ..spec import S3_ROOT_PASSWORD, S3_ROOT_USER, ClusterSpec, S3UserSpec
 from ..topology import ServiceNode, Topology
 from .base import Service
 
 IMAGE = "rustfs/rustfs:1.0.3"
-MC_IMAGE = "clickhouse/minio-mc:RELEASE.2025-04-16T18-13-26Z"
 HOSTNAME = "s3"
 API_PORT = 9000
 CONSOLE_PORT = 9001
@@ -35,6 +36,7 @@ API_OFFSET = 0
 CONSOLE_OFFSET = 1
 #: The alias every mc command uses, so paths read ``s3/<bucket>/<key>``.
 MC_ALIAS = "s3"
+REGION = "us-east-1"
 MC_TIMEOUT = 600
 VOLUME = "s3-data"
 
@@ -61,7 +63,7 @@ class S3(Service):
 
     # --- compose -------------------------------------------------------------------------
 
-    def compose_service(self, topology: Topology, node: ServiceNode) -> dict[str, Any]:
+    def compose_service(self, topology: Topology, node: ServiceNode, root: Path) -> dict[str, Any]:
         return {
             "image": IMAGE,
             "container_name": f"{topology.spec.project_name}-{self.name}",
@@ -111,6 +113,21 @@ class S3(Service):
             notify(f"creating S3 user {user.name}")
             _create_user(spec, user)
 
+    def tool_env(self, topology: Topology, node: ServiceNode) -> dict[str, str]:
+        spec = topology.spec
+        return {
+            # boto3 1.28+ and the AWS CLI honour AWS_ENDPOINT_URL.
+            "AWS_ENDPOINT_URL": network_endpoint(),
+            "AWS_ACCESS_KEY_ID": S3_ROOT_USER,
+            "AWS_SECRET_ACCESS_KEY": S3_ROOT_PASSWORD,
+            "AWS_REGION": REGION,
+            "AWS_DEFAULT_REGION": REGION,
+            "CHLAB_S3_ENDPOINT": network_endpoint(),
+            "CHLAB_S3_BUCKET": spec.effective_buckets[0],
+            "CHLAB_S3_BUCKETS": ",".join(spec.effective_buckets),
+            f"MC_HOST_{MC_ALIAS}": f"http://{S3_ROOT_USER}:{S3_ROOT_PASSWORD}@{HOSTNAME}:{API_PORT}",
+        }
+
     def describe(self, topology: Topology, node: ServiceNode) -> dict[str, Any]:
         spec = topology.spec
         default_bucket = spec.effective_buckets[0]
@@ -148,6 +165,7 @@ class S3(Service):
                     f"'{S3_ROOT_USER}', '{S3_ROOT_PASSWORD}')"
                 ),
                 "list": "SELECT _path, _size FROM s3(s3, filename = '**', format = 'One')",
+                **iceberg_without_catalog_sql(spec),
             },
         }
 
@@ -285,3 +303,37 @@ def _create_user(spec: ClusterSpec, user: S3UserSpec) -> None:
         # Re-running setup on a recreated instance finds the policy already attached.
         if "already" not in str(failure).lower():
             raise
+
+
+def iceberg_without_catalog_sql(spec: ClusterSpec) -> dict[str, str]:
+    """Catalog-less Iceberg over the s3 service: a table read straight from its path.
+
+    ``icebergS3`` exists from 24.9; before that the same function is called ``iceberg``.
+    """
+    function = "iceberg" if version_below(spec.version, (24, 9)) else "icebergS3"
+    return {
+        "iceberg_read": f"SELECT * FROM {function}(s3, filename = 'path/to/table')",
+        "iceberg_table": (
+            "CREATE TABLE t ENGINE = IcebergS3(s3, filename = 'path/to/table') "
+            "SETTINGS allow_dynamic_metadata_for_data_lakes = 1"
+        ),
+        "iceberg_local": (
+            "CREATE TABLE t (a Int32) ENGINE = IcebergLocal("
+            "'/var/lib/clickhouse/user_files/t/', 'Parquet')"
+        ),
+    }
+
+
+def version_below(version: str | None, bound: tuple[int, ...]) -> bool:
+    """True when a known version is older than ``bound``. Unknown versions count as new."""
+    if not version:
+        return False
+    parts = []
+    for piece in version.split(".")[: len(bound)]:
+        digits = "".join(character for character in piece if character.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    if not parts:
+        return False  # "head", "latest": not a version, and not an old one either
+    return tuple(parts) < bound

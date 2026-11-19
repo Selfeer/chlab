@@ -8,6 +8,7 @@ service means writing one of these; nothing else in chlab branches on service na
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ..events import EventCallback
@@ -18,8 +19,17 @@ class Service:
     #: The name used with ``--with``, also the compose service name and network hostname.
     name: str
 
-    def compose_service(self, topology: Topology, node: ServiceNode) -> dict[str, Any]:
+    def compose_service(self, topology: Topology, node: ServiceNode, root: Path) -> dict[str, Any]:
+        """The compose definition. ``root`` is the instance directory, where ``files`` live."""
         raise NotImplementedError
+
+    def files(self, topology: Topology) -> dict[str, str]:
+        """Files to write under ``<instance>/services/<name>/``, keyed by relative path."""
+        return {}
+
+    def tool_env(self, topology: Topology, node: ServiceNode) -> dict[str, str]:
+        """Environment for the tools container, so scripts find this service unconfigured."""
+        return {}
 
     def volumes(self) -> list[str]:
         """Named volumes the compose service uses. Removed by ``chlab rm``."""

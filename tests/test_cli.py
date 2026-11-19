@@ -610,3 +610,49 @@ def test_profiles_carry_services_and_s3_users(s3_instance):
     rebuilt = ClusterSpec(name="again", source="/y", **fields)
     assert rebuilt.services == ("s3",)
     assert rebuilt.s3_users == s3_instance.s3_users
+
+
+# --- tools container ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_build(monkeypatch):
+    monkeypatch.setattr("chlab.core.image.ensure_tools_image", lambda: "chlab/tools:test")
+
+
+def test_py_mounts_the_script_and_passes_its_arguments(
+    saved_instance, no_build, monkeypatch, tmp_path
+):
+    script = tmp_path / "make.py"
+    script.write_text("print(1)")
+    calls = []
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: calls.append(command) or 0)
+    result = invoke("py", "lab", str(script), "--rows", "10")
+    assert result.exit_code == 0, result.output
+    assert f"{script}:/chlab/run/make.py:ro" in calls[0]
+    assert calls[0][-5:] == ["chlab/tools:test", "python", "/chlab/run/make.py", "--rows", "10"]
+
+
+def test_py_reads_a_script_from_stdin(saved_instance, no_build, monkeypatch):
+    calls = []
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: calls.append(command) or 0)
+    assert invoke("py", "lab", "-").exit_code == 0
+    assert "-i" in calls[0] and calls[0][-2:] == ["python", "-"]
+
+
+def test_py_exits_with_the_script_exit_code(saved_instance, no_build, monkeypatch, tmp_path):
+    script = tmp_path / "fail.py"
+    script.write_text("raise SystemExit(5)")
+    monkeypatch.setattr("subprocess.call", lambda command, stdin=None: 5)
+    assert invoke("py", "lab", str(script)).exit_code == 5
+
+
+def test_py_reports_a_missing_script(saved_instance, no_build):
+    result = invoke("py", "lab", "nope.py")
+    assert result.exit_code == 1 and "not a file" in result.output
+
+
+def test_tools_runs_a_command_in_the_tools_image(saved_instance, no_build, monkeypatch):
+    calls = capture_call(monkeypatch)
+    assert invoke("tools", "lab", "--", "jq", "--version").exit_code == 0
+    assert calls[0][-3:] == ["chlab/tools:test", "jq", "--version"]

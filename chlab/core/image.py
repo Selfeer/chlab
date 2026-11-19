@@ -38,33 +38,75 @@ ENV LANG=C.UTF-8
 IMAGE_REPOSITORY = "chlab/base"
 BUILD_TIMEOUT = 900
 
+#: Kept in step with the mc image the s3 service uses.
+MC_IMAGE = "clickhouse/minio-mc:RELEASE.2025-04-16T18-13-26Z"
+
+#: Where `chlab py` and `chlab tools` run. Everything a reproduction needs to *create* data
+#: lives here instead of on the host: pyiceberg to write Iceberg tables through a catalog,
+#: pyarrow for Parquet files with exact layouts, boto3 and mc for objects, jq for metadata.
+#: Versions match clickhouse-regression's requirements.txt, so its helpers port unchanged.
+TOOLS_DOCKERFILE = f"""\
+FROM {MC_IMAGE} AS mc
+
+FROM python:3.12-slim
+RUN set -eux; \\
+    apt-get update; \\
+    apt-get install -y --no-install-recommends ca-certificates curl jq; \\
+    rm -rf /var/lib/apt/lists/*; \\
+    pip install --no-cache-dir \\
+        "pyiceberg==0.9.0" \\
+        "pyiceberg-core==0.4.0" \\
+        "pyarrow==20.0.0" \\
+        "boto3==1.34.146"
+COPY --from=mc /usr/bin/mc /usr/local/bin/mc
+ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+"""
+TOOLS_REPOSITORY = "chlab/tools"
+
 
 class ImageError(ChlabError):
     pass
 
 
-def base_image_tag() -> str:
+def image_tag(repository: str, dockerfile: str) -> str:
     """Tag derived from the Dockerfile, so editing it produces a different image."""
-    digest = hashlib.sha256(BASE_DOCKERFILE.encode()).hexdigest()[:12]
-    return f"{IMAGE_REPOSITORY}:{digest}"
+    digest = hashlib.sha256(dockerfile.encode()).hexdigest()[:12]
+    return f"{repository}:{digest}"
+
+
+def base_image_tag() -> str:
+    return image_tag(IMAGE_REPOSITORY, BASE_DOCKERFILE)
+
+
+def tools_image_tag() -> str:
+    return image_tag(TOOLS_REPOSITORY, TOOLS_DOCKERFILE)
 
 
 def ensure_base_image(*, force: bool = False) -> str:
     """Build the base image if it is not already present, returning its tag."""
-    tag = base_image_tag()
+    return _ensure(base_image_tag(), BASE_DOCKERFILE, "base", force=force)
+
+
+def ensure_tools_image(*, force: bool = False) -> str:
+    """Build the tools image if it is not already present, returning its tag."""
+    return _ensure(tools_image_tag(), TOOLS_DOCKERFILE, "tools", force=force)
+
+
+def _ensure(tag: str, dockerfile: str, what: str, *, force: bool) -> str:
     if not force and _image_exists(tag):
         return tag
 
+    # No build context: the Dockerfile is piped in, so nothing on the host is sent to Docker.
     result = subprocess.run(
         ["docker", "build", "-t", tag, "-"],
-        input=BASE_DOCKERFILE,
+        input=dockerfile,
         text=True,
         capture_output=True,
         timeout=BUILD_TIMEOUT,
     )
     if result.returncode != 0:
         raise ImageError(
-            "could not build the chlab base image:\n"
+            f"could not build the chlab {what} image:\n"
             + (result.stderr.strip() or result.stdout.strip())
         )
     return tag

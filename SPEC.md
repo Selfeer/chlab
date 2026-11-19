@@ -267,6 +267,9 @@ field, topology/compose/runtime treat them like keepers. No service is started u
 | `spark` | `tabulario/spark-iceberg` | Opt-in and heavy (20–40s JVM start per call). Only for what pyiceberg cannot write: format v3, deletion vectors, merge-on-read deletes. |
 | later | toxiproxy, Azurite, Kafka | Latency/fault injection in front of S3 first. |
 
+Implemented as `iceberg-rest` → `apache/iceberg-rest-fixture:1.9.1` and `ice-rest` →
+`altinity/ice-rest-catalog:0.16.0`; `spark` is still to come.
+
 Glue is TBD: the only local option, LocalStack Pro, needs a paid token. Nessie, Polaris,
 Hive and Unity have no prior art in clickhouse-regression and are not planned.
 
@@ -345,14 +348,37 @@ received the query undercounts. Verified on a two-node `s3Cluster` read: 2 GETs 
 so a repeated `count()` can show zero GETs. A reproduction about request counts should read
 data and set `enable_filesystem_cache = 0`, or compare cold runs.
 
+### Decisions made for Iceberg
+
+**Two catalogs, one interface.** `iceberg-rest` and `ice-rest` share a `RestCatalog` base;
+they differ in image, port, token and one detail that is easy to get wrong: ClickHouse
+addresses the Apache fixture as `http://iceberg-rest:8181/v1` and ice-rest at its root, while
+pyiceberg takes the root for both and appends `/v1` itself. Both keep their catalog database
+on a named volume — the fixture's default in-memory SQLite is per connection, so concurrent
+requests would see different, empty catalogs — and both survive `stop`/`start`.
+
+**The tools image is the only place data is created.** `chlab/tools` is `python:3.12-slim`
+with clickhouse-regression's pins (pyiceberg 0.9.0, pyiceberg-core 0.4.0, pyarrow 20.0.0,
+boto3 1.34.146) plus mc and jq, built from a Dockerfile piped to `docker build` with no
+context, tagged by the Dockerfile's hash. pyiceberg's `[pyarrow]` extra cannot be combined
+with pyarrow 20, which is why the packages are installed plainly, as the regression suite
+does. Each service contributes its environment (`PYICEBERG_CATALOG__<NAME>__…`,
+`AWS_ENDPOINT_URL`, `MC_HOST_s3`), so a script needs no configuration. The `chlab_tools`
+helper is mounted from the chlab checkout rather than baked in, so it always matches the
+chlab that runs it.
+
+**Version gating lives with the snippets.** `DataLakeCatalog` from 25.3 (`Iceberg` before),
+`icebergS3` from 24.9 (`iceberg` before). A version that does not parse — `head` — counts as
+new, not old.
+
 ### Phases
 
 1. **Interaction primitives** — done. `exec`, `cp`, `restart`, `query --file` and
    `--setting`, `up --query-setting`, server error codes in output and JSON, `env --json`.
 2. **Object storage** — done. The service framework, `s3` with buckets and scoped
    identities, the `chlab s3` commands, named collections, `query --events`.
-3. **Iceberg:** catalog-less (`icebergS3`, `IcebergLocal`), `iceberg-rest`, `ice-rest`, the
-   tools image and `chlab py`.
+3. **Iceberg** — done. `iceberg-rest`, `ice-rest`, the tools image, `chlab py` and
+   `chlab tools`, version-gated SQL for catalog and catalog-less use.
 4. **Reproduction files:** `chlab repro run`, with `--compare`.
 5. **On demand:** `spark`, toxiproxy, Azurite, cluster-function setups for `s3Cluster` /
    `icebergS3Cluster`.

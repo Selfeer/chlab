@@ -99,6 +99,8 @@ chlab down        remove containers, keep data and definition
 chlab rm          delete everything, including data volumes
 chlab ui          web interface
 chlab s3          buckets and objects of the s3 service
+chlab py          run a Python script (pyiceberg, pyarrow, boto3) wired to an instance
+chlab tools       run any command (jq, mc, curl) in the same tools container
 chlab profiles    saved topologies
 chlab resolve     resolve a source without launching
 chlab cache       inspect or clear the artifact cache
@@ -118,7 +120,7 @@ chlab cache       inspect or clear the artifact cache
 | `-d`, `--database` | `name[:Atomic\|Replicated]`. Repeatable |
 | `--setting` | Server setting (`config.d`) as `key=value`. Repeatable |
 | `--query-setting` | Query setting for every session (default profile), e.g. `allow_insert_into_iceberg=1`. Repeatable |
-| `-w`, `--with` | Companion service: `s3`. Repeatable |
+| `-w`, `--with` | Companion service: `s3`, `iceberg-rest`, `ice-rest`. Repeatable |
 | `--bucket` | Bucket to create in `s3` (default `warehouse`). Repeatable |
 | `--s3-user` | Extra S3 identity, `name:secret[:readwrite\|readonly\|writeonly[:bucket,…]]`. Repeatable |
 | `--seed` | Create the `demo` database with generated rows |
@@ -212,6 +214,59 @@ chlab s3 mb  lake scratch
 chlab s3 ls  lake other --as reader                       # act as an --s3-user identity
 chlab s3 mc  lake -- stat s3/warehouse/in/a.parquet       # anything else mc can do
 ```
+
+## Iceberg
+
+Three ways ClickHouse meets Iceberg, all available locally:
+
+| | Start with | ClickHouse side |
+|---|---|---|
+| no catalog, on S3 | `--with s3` | `icebergS3(s3, filename = 'path/to/table')`, `ENGINE = IcebergS3(...)` |
+| no catalog, local | nothing | `ENGINE = IcebergLocal('/var/lib/clickhouse/user_files/t/', 'Parquet')` |
+| REST catalog | `--with s3 --with iceberg-rest` | `DataLakeCatalog` database |
+| ice-rest-catalog | `--with s3 --with ice-rest` | `DataLakeCatalog` database, bearer token |
+
+`iceberg-rest` is Apache's reference catalog (`apache/iceberg-rest-fixture:1.9.1`, format v3
+capable); `ice-rest` is Altinity's (`altinity/ice-rest-catalog:0.16.0`). Both match
+clickhouse-regression. `chlab env` prints the `CREATE DATABASE` for each catalog in the syntax
+the instance's version needs (`Iceberg` before 25.3, `DataLakeCatalog` after):
+
+```bash
+chlab up -c <source> --name lake --with s3 --with iceberg-rest
+chlab env lake                         # endpoints and ready-to-run SQL for every service
+```
+
+### Writing tables: `chlab py`
+
+Tables are written the way users write them — through a catalog, with pyiceberg — in a tools
+container that already knows the instance: catalogs, S3 and the ClickHouse nodes are
+configured through its environment, and the `chlab_tools` module gives shortcuts. The current
+directory is the script's working directory, so it can read local files and leave results.
+
+```python
+# make_table.py
+import pyarrow as pa
+from chlab_tools import catalog, BUCKET, rows
+
+cat = catalog()  # the first catalog; catalog("ice") for ice-rest
+cat.create_namespace_if_not_exists("demo")
+table = cat.create_table(
+    "demo.events", schema=pa.schema([("id", pa.int64())]), location=f"s3://{BUCKET}/events"
+)
+table.append(pa.table({"id": pa.array(range(100), pa.int64())}))
+print(rows("SELECT count() AS c FROM icebergS3(s3, filename = 'events')"))
+```
+
+```bash
+chlab py lake make_table.py [args...]   # or: chlab py lake - <<'EOF' ... EOF
+chlab tools lake -- mc ls -r s3/warehouse/events/metadata
+chlab tools lake -- sh -c 'mc cat s3/warehouse/events/metadata/<file>.metadata.json | jq ".\"metadata-log\""'
+```
+
+`chlab_tools` provides `catalog(name=None)`, `s3()` (a boto3 client), `query(sql, node=...,
+settings=...)`, `rows(sql)`, and `BUCKET`, `BUCKETS`, `CATALOGS`, `NODES`. The image pins
+clickhouse-regression's versions: pyiceberg 0.9.0, pyarrow 20.0.0, boto3 1.34.146, plus mc and
+jq. It is built once, on first use.
 
 ## Examples
 

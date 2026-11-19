@@ -43,7 +43,7 @@ def render(topology: Topology, resolved: Resolved, root: Path, image: str) -> di
         volumes[_volume_name(node.name)] = None
 
     for service, endpoint in companions.active(topology):
-        services[service.name] = service.compose_service(topology, endpoint)
+        services[service.name] = service.compose_service(topology, endpoint, root)
         for volume in service.volumes():
             volumes[volume] = None
 

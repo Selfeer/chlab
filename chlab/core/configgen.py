@@ -41,6 +41,11 @@ def write_configs(topology: Topology, root: Path, *, base_image_mode: bool) -> N
         _write_node_configs(topology, node, configs / node.name, base_image_mode=base_image_mode)
     for keeper in topology.keepers:
         _write_keeper_configs(topology, keeper, configs / keeper.name)
+    for service, _endpoint in companions.active(topology):
+        for relative, content in service.files(topology).items():
+            path = root / "services" / service.name / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
 
 
 def _write_node_configs(

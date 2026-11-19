@@ -262,8 +262,9 @@ def up_command(
         typer.Option(
             "--with",
             "-w",
-            help="Start a companion service next to the cluster: s3 (RustFS object storage). "
-            "Repeatable.",
+            help="Start a companion service next to the cluster: s3 (RustFS object storage), "
+            "iceberg-rest (Apache REST catalog), ice-rest (Altinity ice-rest-catalog). The "
+            "catalogs need s3. Repeatable.",
         ),
     ] = None,
     bucket: Annotated[
@@ -752,13 +753,104 @@ def env_command(name: NameArgument, json: JsonOption = False) -> None:
         table.add_row("", "", node["host"]["native"], node["network"]["native"])
     for keeper in info["keepers"]:
         table.add_row(keeper["name"], keeper["container"], keeper["host"], keeper["network"])
+    for service_name, service in info["services"].items():
+        table.add_row(
+            service_name,
+            service["container"],
+            service["host"]["endpoint"],
+            service["network"].get("clickhouse") or service["network"]["endpoint"],
+        )
     console.print(table)
     console.print()
+
+    for service_name, service in info["services"].items():
+        snippets = _kv_table()
+        for label, sql in service.get("sql", {}).items():
+            snippets.add_row(f"{service_name} {label}", sql)
+        console.print(snippets)
+    if info["services"]:
+        console.print()
 
     users = _kv_table()
     for user in info["users"]:
         users.add_row(user["name"], f"password={user['password']!r} role={user['role']}")
     console.print(users)
+
+
+# --- tools container ---------------------------------------------------------------------
+
+
+@app.command("py", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def py_command(
+    ctx: typer.Context,
+    name: NameArgument,
+    script: Annotated[str, typer.Argument(help="Python script to run, or '-' for stdin.")],
+) -> None:
+    """Run a Python script in the tools container, wired to the instance.
+
+    pyiceberg, pyarrow and boto3 are installed; catalogs, S3 and the ClickHouse nodes are
+    configured through the environment, and `import chlab_tools` gives shortcuts:
+    catalog(), s3(), query(sql), rows(sql), BUCKET, NODES. The current directory is
+    mounted at /work (the working directory), so the script reads and writes local files.
+    Arguments after the script are passed to it. Exits with the script's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.image import ensure_tools_image
+    from .core.tools import tools_command
+
+    try:
+        spec = Registry().load(name)
+        if script == "-":
+            command, mounts, stdin = ["python", "-", *ctx.args], [], True
+        else:
+            path = Path(script).expanduser().resolve()
+            if not path.is_file():
+                raise SpecError(f"{script} is not a file")
+            target = f"/chlab/run/{path.name}"
+            command, mounts, stdin = ["python", target, *ctx.args], [(str(path), target)], False
+        image = ensure_tools_image()
+        docker_command = tools_command(
+            spec, command, image=image, workdir=Path.cwd(), mounts=mounts, interactive=stdin
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command, stdin=sys.stdin if stdin else None))
+
+
+@app.command("tools")
+def tools_shell_command(
+    name: NameArgument,
+    command: Annotated[
+        list[str] | None,
+        typer.Argument(help="Command to run, after `--`. Defaults to bash."),
+    ] = None,
+) -> None:
+    """Run any command in the tools container: jq, mc, curl, python, aws-style boto3 scripts.
+
+    Same environment and /work mount as `chlab py`. Exits with the command's exit code.
+    """
+    import subprocess
+    import sys
+
+    from .core.image import ensure_tools_image
+    from .core.tools import tools_command
+
+    try:
+        spec = Registry().load(name)
+        image = ensure_tools_image()
+        docker_command = tools_command(
+            spec,
+            command or ["bash"],
+            image=image,
+            workdir=Path.cwd(),
+            interactive=True,
+            tty=sys.stdin.isatty() and sys.stdout.isatty(),
+        )
+    except ChlabError as failure:
+        _fail(failure)
+    raise typer.Exit(code=subprocess.call(docker_command))
 
 
 # --- s3 ----------------------------------------------------------------------------------

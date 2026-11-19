@@ -21,7 +21,9 @@ MAX_NODES = 30
 #: Bounds the keeper port range, so companion service ports can sit above it.
 MAX_KEEPERS = 9
 #: Companion services ``--with`` accepts. Each has a module in ``chlab.core.services``.
-KNOWN_SERVICES = ("s3",)
+KNOWN_SERVICES = ("s3", "iceberg-rest", "ice-rest")
+#: Services that cannot run without others. Catalogs keep their tables in object storage.
+SERVICE_REQUIREMENTS = {"iceberg-rest": ("s3",), "ice-rest": ("s3",)}
 DEFAULT_BUCKET = "warehouse"
 #: S3 bucket naming rules, minus the ones (no IP-address names) no one hits in a lab.
 BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -190,6 +192,10 @@ class ClusterSpec:
                 )
         if len(set(self.services)) != len(self.services):
             raise SpecError("each service can be requested only once")
+        for service in self.services:
+            for required in SERVICE_REQUIREMENTS.get(service, ()):
+                if required not in self.services:
+                    raise SpecError(f"{service} needs {required}; add --with {required}")
 
         if (self.buckets or self.s3_users) and not self.has_service("s3"):
             raise SpecError("--bucket and --s3-user need the s3 service; add --with s3")

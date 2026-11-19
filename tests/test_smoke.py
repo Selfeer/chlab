@@ -111,3 +111,43 @@ def test_s3_service_round_trip(runtime: Runtime):
         assert denied.value.code == 499  # S3_ERROR: the storage refused the scoped identity
     finally:
         runtime.destroy("smoke-s3")
+
+
+def test_iceberg_table_written_by_pyiceberg_is_read_by_clickhouse(runtime: Runtime, tmp_path: Path):
+    """The tools container writes through the REST catalog; ClickHouse reads the files."""
+    import subprocess
+
+    from chlab.core.image import ensure_tools_image
+    from chlab.core.services.s3 import iceberg_without_catalog_sql
+    from chlab.core.tools import tools_command
+
+    spec = ClusterSpec(name="smoke-ice", source=IMAGE, services=("s3", "iceberg-rest"))
+    script = """
+import pyarrow as pa
+from chlab_tools import catalog, BUCKET
+cat = catalog()
+cat.create_namespace_if_not_exists("demo")
+table = cat.create_table("demo.t", schema=pa.schema([("id", pa.int64())]), location=f"s3://{BUCKET}/t")
+table.append(pa.table({"id": pa.array(range(42), pa.int64())}))
+"""
+    try:
+        status = runtime.up(spec)
+        result = subprocess.run(
+            tools_command(
+                status.spec,
+                ["python", "-"],
+                image=ensure_tools_image(),
+                workdir=tmp_path,
+                interactive=True,
+            ),
+            input=script,
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
+        read = iceberg_without_catalog_sql(status.spec)["iceberg_read"].replace(
+            "path/to/table", "t"
+        )
+        assert int(runtime.query("smoke-ice", read.replace("*", "count()")).rows[0][0]) == 42
+    finally:
+        runtime.destroy("smoke-ice")
