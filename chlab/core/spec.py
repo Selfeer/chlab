@@ -29,6 +29,9 @@ SERVICE_REQUIREMENTS = {
     "spark": ("s3",),
     "toxiproxy": ("s3",),
 }
+#: Iceberg REST catalogs. Each name is also a database engine: ``rest:iceberg-rest`` creates a
+#: ``DataLakeCatalog`` database ``rest`` on every node, in front of that catalog.
+CATALOG_SERVICES = ("iceberg-rest", "ice-rest")
 #: Services that need at least one of these. Spark writes tables through a catalog.
 SERVICE_NEEDS_ONE_OF = {"spark": ("iceberg-rest", "ice-rest")}
 DEFAULT_BUCKET = "warehouse"
@@ -85,7 +88,8 @@ class UserSpec:
 @dataclass(frozen=True)
 class DatabaseSpec:
     name: str
-    #: ``Atomic`` or ``Replicated``. Replicated requires Keeper.
+    #: ``Atomic``, ``Replicated`` (requires Keeper), or a catalog service from
+    #: ``CATALOG_SERVICES``, which must run with the instance.
     engine: str = "Atomic"
 
 
@@ -196,6 +200,11 @@ class ClusterSpec:
                 raise SpecError(
                     f"database {database.name!r} uses the Replicated engine, which needs Keeper; "
                     "pass --keeper 1 or more"
+                )
+            if database.engine in CATALOG_SERVICES and database.engine not in self.services:
+                raise SpecError(
+                    f"database {database.name!r} is a catalog database for {database.engine}, "
+                    f"which this instance does not run; add --with {database.engine}"
                 )
 
     def _validate_services(self) -> None:
@@ -383,14 +392,21 @@ def parse_grant(text: str) -> tuple[str, str]:
 
 
 def parse_database(text: str) -> DatabaseSpec:
-    """Parse a ``--database name[:engine]`` argument."""
+    """Parse a ``--database name[:engine]`` argument.
+
+    The engine is ``Atomic`` (the default), ``Replicated``, or a catalog service such as
+    ``iceberg-rest``: ``rest:iceberg-rest`` is a ``DataLakeCatalog`` database over that catalog.
+    """
     name, _, engine = text.partition(":")
     name = name.strip()
     if not name:
         raise SpecError(f"database {text!r} has no name")
     engine = (engine or "Atomic").strip()
-    if engine not in {"Atomic", "Replicated"}:
-        raise SpecError(f"unsupported database engine {engine!r}; use Atomic or Replicated")
+    if engine not in {"Atomic", "Replicated", *CATALOG_SERVICES}:
+        raise SpecError(
+            f"unsupported database engine {engine!r}; use Atomic, Replicated or a catalog "
+            f"service ({', '.join(CATALOG_SERVICES)})"
+        )
     return DatabaseSpec(name=name, engine=engine)
 
 

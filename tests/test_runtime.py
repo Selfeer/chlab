@@ -197,3 +197,32 @@ def test_environment_reports_host_and_network_endpoints(runtime):
     assert info["network"] == "chlab-lab_default"
     assert info["keepers"][0]["network"] == "keeper1:9181"
     assert info["users"][0]["name"] == "default"
+
+
+def test_initialise_creates_catalog_databases_with_their_setting(tmp_path: Path, monkeypatch):
+    from chlab.core.spec import DatabaseSpec
+    from chlab.core.topology import build_topology
+
+    calls = []
+    monkeypatch.setattr("chlab.core.runtime.companions.active", lambda topology: iter(()))
+    monkeypatch.setattr(
+        "chlab.core.runtime.execute",
+        lambda url, sql, **kwargs: calls.append((kwargs["node"], sql, kwargs.get("settings"))),
+    )
+    topology = build_topology(
+        ClusterSpec(
+            name="lab",
+            source="/x",
+            shards=2,
+            services=("s3", "iceberg-rest"),
+            databases=(DatabaseSpec("rest", "iceberg-rest"),),
+            version="26.8.1.1",
+            port_base=21600,
+        )
+    )
+    Runtime(registry=Registry(tmp_path / "state"))._initialise(topology, notify=lambda _m: None)
+
+    assert [node for node, _sql, _settings in calls] == ["clickhouse1", "clickhouse2"]
+    for _node, sql, settings in calls:
+        assert "ENGINE = DataLakeCatalog(" in sql
+        assert settings == {"allow_experimental_database_iceberg": "1"}

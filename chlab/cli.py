@@ -258,7 +258,10 @@ def up_command(
     database: Annotated[
         list[str] | None,
         typer.Option(
-            "--database", "-d", help="Create a database: name[:Atomic|Replicated]. Repeatable."
+            "--database",
+            "-d",
+            help="Create a database: name[:Atomic|Replicated|iceberg-rest|ice-rest]. A catalog "
+            "service as the engine makes a DataLakeCatalog database over it. Repeatable.",
         ),
     ] = None,
     setting: Annotated[

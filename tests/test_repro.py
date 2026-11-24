@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from chlab.cli import app
@@ -364,6 +365,16 @@ def test_init_then_check(isolated: Path):
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["steps"][0]["step"] == "01-setup.sql"
     assert runner.invoke(app, ["repro", "init", str(directory)]).exit_code == 1
+
+
+def test_init_quotes_a_title_with_a_colon(isolated: Path):
+    """Titles are usually "PR 1234: what"; unquoted, ': ' breaks the YAML."""
+    directory = isolated / "titled"
+    title = 'PR 2832: a partner subquery is "computed" once'
+    assert runner.invoke(app, ["repro", "init", str(directory), "--title", title]).exit_code == 0
+    assert yaml.safe_load((directory / "repro.yaml").read_text())["title"] == title
+    result = runner.invoke(app, ["repro", "check", str(directory)])
+    assert result.exit_code == 0, result.output
 
 
 def _stub_run(monkeypatch, run_result):

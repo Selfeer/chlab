@@ -23,6 +23,8 @@ from ..topology import ServiceNode, Topology
 from . import s3
 from .base import Service
 
+#: Query setting a catalog database needs to be created.
+DATABASE_SETTING = "allow_experimental_database_iceberg"
 #: Host port offset of each catalog's HTTP API within its reserved stride.
 API_OFFSET = 0
 
@@ -103,10 +105,14 @@ class RestCatalog(Service):
         }
 
     def database_sql(self, spec: ClusterSpec, database: str | None = None) -> str:
-        """``CREATE DATABASE`` for this catalog, in the syntax the instance's version needs.
+        """``CREATE DATABASE`` for this catalog, with the setting it needs, to paste in a client."""
+        return f"SET {DATABASE_SETTING} = 1; {self.create_database_statement(spec, database)}"
+
+    def create_database_statement(self, spec: ClusterSpec, database: str | None = None) -> str:
+        """``CREATE DATABASE IF NOT EXISTS`` for this catalog, in the syntax the version needs.
 
         The engine was ``Iceberg`` before 25.3 and ``DataLakeCatalog`` from then on; both
-        need ``allow_experimental_database_iceberg``.
+        need ``DATABASE_SETTING``, which the caller sets.
         """
         engine = "Iceberg" if s3.version_below(spec.version, (25, 3)) else "DataLakeCatalog"
         settings = [
@@ -117,9 +123,9 @@ class RestCatalog(Service):
         if self.token:
             settings.append(f"auth_header = 'Authorization: Bearer {self.token}'")
         name = database or self.name.replace("-", "_")
+        quoted = "`" + name.replace("\\", "\\\\").replace("`", "``") + "`"
         return (
-            "SET allow_experimental_database_iceberg = 1; "
-            f"CREATE DATABASE {name} ENGINE = {engine}('{self.clickhouse_url()}', "
+            f"CREATE DATABASE IF NOT EXISTS {quoted} ENGINE = {engine}('{self.clickhouse_url()}', "
             f"'{S3_ROOT_USER}', '{S3_ROOT_PASSWORD}') SETTINGS {', '.join(settings)}"
         )
 

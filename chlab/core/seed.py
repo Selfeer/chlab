@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .spec import ClusterSpec, UserRole, UserSpec
+from .services import REGISTRY
+from .services.catalogs import DATABASE_SETTING
+from .spec import CATALOG_SERVICES, ClusterSpec, UserRole, UserSpec
 from .topology import Topology
 
 DEMO_DATABASE = "demo"
@@ -32,6 +34,10 @@ class InitPlan:
 
     #: Statements to run on every node.
     common: list[str] = field(default_factory=list)
+    #: Catalog databases, run on every node with ``catalog_settings``. Over HTTP a statement
+    #: cannot carry its own ``SET``, and the setting is not one to put in every session.
+    catalog_databases: list[str] = field(default_factory=list)
+    catalog_settings: dict[str, str] = field(default_factory=lambda: {DATABASE_SETTING: "1"})
     #: Demo table DDL, also run on every node.
     seed_ddl: list[str] = field(default_factory=list)
     #: Node name -> insert statement. Only the first replica of each shard inserts; the
@@ -50,7 +56,11 @@ def build_plan(topology: Topology) -> InitPlan:
     for user in spec.users:
         plan.common.extend(user_statements(user))
     for database in spec.databases:
-        plan.common.append(database_statement(database.name, database.engine))
+        if database.engine in CATALOG_SERVICES:
+            catalog = REGISTRY[database.engine]
+            plan.catalog_databases.append(catalog.create_database_statement(spec, database.name))
+        else:
+            plan.common.append(database_statement(database.name, database.engine))
 
     if spec.seed:
         plan.seed_ddl = seed_ddl(spec)

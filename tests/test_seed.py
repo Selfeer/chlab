@@ -153,6 +153,35 @@ def test_plan_collects_users_and_databases():
     assert any("CREATE DATABASE IF NOT EXISTS `analytics`" in s for s in plan.common)
 
 
+def test_catalog_database_is_planned_with_its_setting():
+    """A DataLakeCatalog database on every node, created with the setting it needs."""
+    plan = seed.build_plan(
+        topology(
+            services=("s3", "iceberg-rest"),
+            databases=(DatabaseSpec("rest", "iceberg-rest"),),
+            version="26.8.1.1",
+        )
+    )
+    assert not plan.common
+    (statement,) = plan.catalog_databases
+    assert statement.startswith("CREATE DATABASE IF NOT EXISTS `rest` ENGINE = DataLakeCatalog(")
+    assert "'http://iceberg-rest:8181/v1'" in statement
+    assert "SET " not in statement  # one statement: HTTP runs one at a time
+    assert plan.catalog_settings == {"allow_experimental_database_iceberg": "1"}
+
+
+def test_catalog_database_uses_the_iceberg_engine_before_25_3():
+    plan = seed.build_plan(
+        topology(
+            services=("s3", "ice-rest"),
+            databases=(DatabaseSpec("ice", "ice-rest"),),
+            version="24.8.1.1",
+        )
+    )
+    assert "ENGINE = Iceberg(" in plan.catalog_databases[0]
+    assert "auth_header = 'Authorization: Bearer" in plan.catalog_databases[0]
+
+
 def test_plan_includes_demo_data_only_when_asked():
     assert not seed.build_plan(topology()).has_seed
     assert seed.build_plan(topology(seed=True)).has_seed

@@ -127,6 +127,23 @@ def test_parse_database_rejects_unknown_engine():
         parse_database("analytics:Log")
 
 
+@pytest.mark.parametrize("catalog", ["iceberg-rest", "ice-rest"])
+def test_parse_database_accepts_a_catalog_service_as_engine(catalog):
+    assert parse_database(f"rest:{catalog}") == DatabaseSpec("rest", catalog)
+
+
+def test_rejects_catalog_database_without_its_catalog():
+    with pytest.raises(SpecError, match="add --with iceberg-rest"):
+        spec(services=("s3",), databases=(DatabaseSpec("rest", "iceberg-rest"),))
+
+
+def test_accepts_catalog_database_with_its_catalog():
+    result = spec(
+        services=("s3", "iceberg-rest"), databases=(DatabaseSpec("rest", "iceberg-rest"),)
+    )
+    assert result.databases[0].engine == "iceberg-rest"
+
+
 # --- naming ------------------------------------------------------------------------------
 
 

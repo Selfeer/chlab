@@ -120,7 +120,7 @@ chlab cache       inspect or clear the artifact cache
 | `-k`, `--keeper` | Keeper nodes. Defaults to 1 when replicating, 0 otherwise |
 | `-u`, `--user` | `name[:password][:role]`. Repeatable |
 | `--grant` | `user:PRIVILEGES ON target`. Repeatable |
-| `-d`, `--database` | `name[:Atomic\|Replicated]`. Repeatable |
+| `-d`, `--database` | `name[:Atomic\|Replicated\|iceberg-rest\|ice-rest]`. A catalog service as the engine creates a `DataLakeCatalog` database over it on every node (needs `--with` that catalog). Repeatable |
 | `--setting` | Server setting (`config.d`) as `key=value`. Repeatable |
 | `--query-setting` | Query setting for every session (default profile), e.g. `allow_insert_into_iceberg=1`. Repeatable |
 | `-w`, `--with` | Companion service: `s3`, `iceberg-rest`, `ice-rest`, `spark`, `toxiproxy`. Repeatable |

@@ -726,7 +726,7 @@ replicas: 1
 # keeper: 1
 # users: ["dev:pw:readonly"]
 # grants: ["dev:NAMED COLLECTION ON s3"]
-# databases: ["analytics:Replicated"]
+# databases: ["analytics:Replicated", "rest:iceberg-rest"]   # rest: DataLakeCatalog
 # settings: {{max_concurrent_queries: 200}}        # server, config.d
 # query_settings: {{allow_insert_into_iceberg: 1}} # every session
 # buckets: [warehouse, other]
@@ -752,7 +752,9 @@ def init(directory: Path, *, title: str | None = None, services: list[str] | Non
     directory.mkdir(parents=True, exist_ok=True)
     with_line = f"with: [{', '.join(services)}]" if services else "# with: [s3, iceberg-rest]"
     (directory / REPRO_FILE).write_text(
-        INIT_YAML.format(title=title or directory.name, with_line=with_line)
+        # JSON is valid YAML, so json.dumps quotes and escapes the title: titles often hold
+        # ": " ("PR 2832: ..."), which would otherwise make the file fail to parse.
+        INIT_YAML.format(title=json.dumps(title or directory.name), with_line=with_line)
     )
     step = directory / "01-setup.sql"
     if not step.exists():

@@ -548,12 +548,14 @@ class Runtime:
                 ) from failure
 
         plan = seed.build_plan(topology)
-        if not plan.common and not plan.has_seed:
+        if not plan.common and not plan.catalog_databases and not plan.has_seed:
             return
 
         notify("creating users and databases")
         for node in topology.nodes:
             self._run_statements(node, plan.common)
+            if plan.catalog_databases:
+                self._run_statements(node, plan.catalog_databases, settings=plan.catalog_settings)
 
         if not plan.has_seed:
             return
@@ -568,10 +570,12 @@ class Runtime:
                 notify(f"seeding {node.name}")
                 self._run_statements(node, [statement])
 
-    def _run_statements(self, node: Node, statements: Iterable[str]) -> None:
+    def _run_statements(
+        self, node: Node, statements: Iterable[str], *, settings: dict[str, str] | None = None
+    ) -> None:
         for statement in statements:
             try:
-                execute(node.http_url, statement, node=node.name)
+                execute(node.http_url, statement, node=node.name, settings=settings)
             except QueryError as failure:
                 raise InitError(
                     f"the cluster is running, but initialisation failed on {node.name}:\n"
