@@ -50,6 +50,19 @@ Write down the following:
 
 ## Step 2: Pick the builds
 
+### First: is the PR from a fork?
+
+```bash
+gh pr view <PR> --repo Altinity/ClickHouse --json isCrossRepository --jq .isCrossRepository
+```
+
+- `false`: the builds are on S3. The rest of this step applies as written.
+- `true` (a fork, workflow "Community PR"): CI uploads nothing to S3, and `PRs/<PR>/` lists
+  nothing. The builds are GitHub Actions artifacts of the run. Download
+  `CH_AMD_RELEASE_STRIPPED` (~190 MB, about 3 minutes) with `gh run download`. It holds
+  `clickhouse-stripped`: rename it to `clickhouse` and point `clickhouse:` at its path. The
+  commands are in `.claude/skills/_shared/ci-urls.md`. PR 2832 was such a PR.
+
 ### Use the release `.deb`, not the `amd_binary`
 
 | Artifact | Size | Use |
@@ -62,7 +75,8 @@ took 3 minutes and the `amd_binary` took 19–30 minutes, for the same code (sam
 `GIT_HASH`). Failpoints work in the release build too: `SYSTEM ENABLE FAILPOINT` works,
 and an unknown name is rejected with `BAD_ARGUMENTS`.
 
-List what a commit's CI produced. The pattern is in `.claude/skills/_shared/ci-urls.md`:
+List what a commit's CI produced (S3 PRs; both layouts are in
+`.claude/skills/_shared/ci-urls.md`):
 
 ```bash
 PR=<PR>; SHA=<full sha>
@@ -93,11 +107,11 @@ report: it is the same code, packaged differently.
 
 ### Start downloads first
 
-Start the downloads before writing any step, in the background, one `chlab resolve` per
-build:
+Start the downloads before writing any step, in the background, one per build:
 
 ```bash
-chlab resolve <url>        # background it; it caches under ~/.cache/chlab
+chlab resolve <url>        # S3: background it; it caches under ~/.cache/chlab
+gh run download <run> --repo Altinity/ClickHouse -n CH_AMD_RELEASE_STRIPPED -D <dir>   # fork PR
 ```
 
 ### Confirm which code you downloaded
@@ -132,6 +146,7 @@ compare: <review head .deb URL>          # omit when "before" is impossible
 shards: 2
 replicas: 1
 with: [s3, iceberg-rest]
+databases: ["rest:iceberg-rest"]         # a DataLakeCatalog database `rest`, on every node
 query_settings:
   allow_experimental_database_iceberg: 1
 ```
@@ -179,6 +194,11 @@ Always disable failpoints in a `finally:` block.
 
 ### Data the companion services do not create
 
+- **Catalog database:** `with: [iceberg-rest]` starts the catalog, but ClickHouse sees it only
+  through a database. `databases: ["rest:iceberg-rest"]` (or `ice-rest`) makes chlab create a
+  `DataLakeCatalog` database `rest` on every node at startup. Tables written with pyiceberg
+  as `demo.t` are then ``rest.`demo.t` ``. Every node needs it, not only the initiator,
+  because cluster reads resolve the table on each node.
 - **Iceberg:** use pyiceberg in a `.py` step (`chlab_tools.catalog()`), or `.spark` steps.
 - **Delta Lake:** chlab has no Delta support. Write a minimal table by hand: Parquet files
   from pyarrow, plus `_delta_log/<version:020d>.json` with `protocol`, `metaData`, `add`
@@ -199,8 +219,18 @@ chlab repro run <dir> --keep             # keep the instances to inspect failure
 chlab repro run <dir>                    # final clean run; its report.md is the evidence
 ```
 
-Read `results/<timestamp>/result.json`: each step has `step`, `exit_code`,
-`error_code`, `output`, `error_output` and `diff`. Before calling a failure a reproduced
+Read `results/<timestamp>/result.json`. The steps are per build, under
+`builds[].steps` (one build, or two with `compare:`). Each step has `step`, `passed`,
+`exit_code`, `error_code`, `output`, `error_output` and `diff`:
+
+```bash
+python3 -I -c "
+import json, sys
+for build in json.load(open(sys.argv[1]))['builds']:
+    for s in build['steps']:
+        print(s['step'], s['passed'], s['output'].strip(), s['error_output'].strip()[:500], sep=' | ')
+" results/<timestamp>/result.json
+``` Before calling a failure a reproduced
 bug, read its `error_output`. Check that it is the finding's error and not a mistake in
 your own step.
 
@@ -215,6 +245,7 @@ your own step.
 | A loop over node names runs once with all the names | zsh does not split `$var` into words. Run such loops with `bash -c '...'`. |
 | `zsh: ====== not found` | zsh treats a word starting with `=` as a command lookup. Quote dividers. |
 | A stopped node still runs queries | PID 1 is the watchdog (`ClickHouseWatch`). Stop the `clickhouse` process instead: ``kill -STOP $(ps -eo pid,comm \| awk '$2=="clickhouse"{print $1}')``. Send `-CONT` before cleanup. |
+| A wrong result shows up in only some runs | The bug is a race, for example workers that each recompute a non-deterministic subquery. Run the query N times in a `.py` step. Print a stable count of bad runs to stdout, matched by a `.reference`, and the observed result sets to stderr. PR 2832 split in about 10% of runs. A passing run is not proof the bug is gone. |
 | A failpoint "reproduction" passes on the buggy build | Check what the failpoint simulates. A failpoint that throws immediately cannot open a timing window: PR 2912's `pooled_connection_ping_timeout` could not reproduce a race that needed a blocking `Ping`. |
 
 ## Step 5: Faults chlab cannot inject
